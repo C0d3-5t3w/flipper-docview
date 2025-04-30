@@ -15,8 +15,8 @@ App(
     fap_weburl="https://github.com/C0d3-5t3w/flipper-docview",
     fap_icon_assets="images",  # Image assets to compile for this application
     
-    # Add BT dependency
-    fap_libs=["bt_service"],
+    # Remove the bt_service library dependency since we're implementing our own
+    # fap_libs=["bt_service"],
     
     # Include all required source files
     sources=[
@@ -25,4 +25,7 @@ App(
         "ble_transport.c",
         "icons/ble_icons.c",
     ],
+    
+    # Include header files
+    cdefines=["DOCVIEW_VERSION=\"1.0\""],
 )

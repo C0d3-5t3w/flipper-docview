@@ -1,5 +1,6 @@
 #include <furi.h>
 #include <furi_hal.h>
+#include <furi_hal_bt.h>
 #include <gui/gui.h>
 #include <gui/view.h>
 #include <gui/view_dispatcher.h>
@@ -611,9 +612,6 @@ void docview_ble_transfer_start(DocviewApp* app) {
     // Update UI with initial status
     docview_ble_transfer_update_status(app);
 
-    // Initialize BT service for file transfer
-    app->bt = furi_record_open(RECORD_BT);
-
     // Set up timeout timer
     app->ble_state.timeout_timer =
         furi_timer_alloc(docview_ble_timeout_callback, FuriTimerTypeOnce, app);
@@ -638,12 +636,6 @@ void docview_ble_transfer_stop(DocviewApp* app) {
         furi_timer_stop(app->ble_state.timeout_timer);
         furi_timer_free(app->ble_state.timeout_timer);
         app->ble_state.timeout_timer = NULL;
-    }
-
-    // Close BT service
-    if(app->bt) {
-        furi_record_close(RECORD_BT);
-        app->bt = NULL;
     }
 }
 
@@ -741,7 +733,7 @@ void docview_ble_timeout_callback(void* context) {
 void docview_ble_status_changed_callback(BtStatus status, void* context) {
     DocviewApp* app = context;
 
-    // Handle different BT status updates based on Flipper BT service status values
+    // Handle different BT status updates
     if(status == BtStatusConnected) {
         app->ble_state.status = BleTransferStatusConnected;
         docview_ble_transfer_update_status(app);
@@ -751,7 +743,6 @@ void docview_ble_status_changed_callback(BtStatus status, void* context) {
     }
 
     // Clean up if we're disconnected
-    // Note: Flipper uses only BtStatusConnected explicitly, other statuses must be inferred
     if(status != BtStatusConnected && app->ble_state.status == BleTransferStatusConnected) {
         // If we were connected but now we're not, handle disconnection
         docview_ble_transfer_stop(app);
@@ -981,19 +972,19 @@ static DocviewApp* Docview_app_alloc() {
     app->notifications = furi_record_open(RECORD_NOTIFICATION);
     app->dialogs = furi_record_open(RECORD_DIALOGS);
 
-#ifdef BACKLIGHT_ON
-    notification_message(app->notifications, &sequence_display_backlight_enforce_on);
-#endif
+    // Open BT service record
+    app->bt =
+        NULL; // Just use NULL since we're handling everything in our own bt_service implementation
+    bt_service_subscribe_status(app->bt, docview_ble_status_changed_callback, app);
 
     return app;
 }
 
-/**
- * @brief      Free the Docview application.
- * @details    This function frees the Docview application resources.
- * @param      app  The Docview application object.
- */
 static void Docview_app_free(DocviewApp* app) {
+    // Unsubscribe and close BT service
+    bt_service_unsubscribe_status(app->bt);
+    // No need to close RECORD_BT since we're not using it
+
     // Clean up BLE transfer if active
     docview_ble_transfer_stop(app);
 
@@ -1042,10 +1033,10 @@ static void Docview_app_free(DocviewApp* app) {
  */
 int32_t main_Docview_app(void* _p) {
     UNUSED(_p);
+    furi_hal_bt_init(); // Initialize the hardware layer (keep this)
 
     DocviewApp* app = Docview_app_alloc();
     view_dispatcher_run(app->view_dispatcher);
-
     Docview_app_free(app);
     return 0;
 }

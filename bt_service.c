@@ -1,5 +1,6 @@
 #include "bt_service.h"
 #include "bt_hal_compat.h"
+#include "docview_app.h"
 #include <furi_hal.h>
 #include <furi_hal_bt.h>
 #include <stdint.h>
@@ -11,6 +12,45 @@
 
 #define MAX_BLE_PACKET_SIZE 20
 
+// Globals for BT service callbacks
+static BtEventCallback status_callback = NULL;
+static void* status_context = NULL;
+
+// Initialize the BT service
+bool bt_service_init(void) {
+    return furi_hal_bt_is_active();
+}
+
+// Deinitialize the BT service
+void bt_service_deinit(void) {
+    // Clean up callback
+    status_callback = NULL;
+    status_context = NULL;
+}
+
+// Subscribe to BT status changes
+void bt_service_subscribe_status(void* bt, BtEventCallback callback, void* context) {
+    UNUSED(bt);
+    status_callback = callback;
+    status_context = context;
+    // Initial connection status notification
+    if(callback) {
+        if(furi_hal_bt_is_active()) {
+            callback(BtStatusAdvertising, context);
+        } else {
+            callback(BtStatusOff, context);
+        }
+    }
+}
+
+// Unsubscribe from BT status changes
+void bt_service_unsubscribe_status(void* bt) {
+    UNUSED(bt);
+    status_callback = NULL;
+    status_context = NULL;
+}
+
+// File service implementation (unchanged)
 bool ble_file_service_init(void) {
     if(!furi_hal_bt_is_active()) {
         return false;

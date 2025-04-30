@@ -14,7 +14,16 @@
 #include <notification/notification_messages.h>
 #include <storage/storage.h>
 #include <dialogs/dialogs.h>
-#include <bt/bt_service/bt.h>
+
+// Define our own BT types to avoid dependency on the header
+typedef enum {
+    BtStatusAdvertising,
+    BtStatusConnected,
+    BtStatusDisconnected,
+    BtStatusOff,
+} BtStatus;
+
+typedef void* Bt;
 
 
 typedef enum {
