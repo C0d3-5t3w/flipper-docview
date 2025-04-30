@@ -12,6 +12,6 @@ App(
     fap_icon="docview.png",  # 10x10 1-bit PNG
     fap_description="Read text documents on your Flipper Zero",
     fap_author="Flipper User",
-    fap_weburl="https://github.com/user/flipper-docview",
+    fap_weburl="https://github.com/C0d3-5t3w/flipper-docview",
     fap_icon_assets="images",  # Image assets to compile for this application
 )

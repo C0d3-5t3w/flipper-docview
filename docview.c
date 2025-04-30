@@ -590,7 +590,7 @@ static DocviewApp* Docview_app_alloc() {
         0,
         128,
         64,
-        "Document Viewer for Flipper Zero\n---\nUse this app to read text files.\n\n"
+        "Document Viewer for Flipper Zero\n-Made by: C0d3-5t3w-\nUse this app to read text files.\n\n"
         "Place TXT files in the\n'documents' folder on your SD card.\n\n"
         "Controls:\n"
         "UP/DOWN: Scroll by line\n"
