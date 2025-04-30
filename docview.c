@@ -652,7 +652,7 @@ int32_t docview_ble_transfer_process_callback(void* context) {
 }
 
 static bool docview_ble_transfer_input_callback(InputEvent* event, void* context) {
-    DocviewApp* app = context;
+    DocviewApp* app = (DocviewApp*)context;
 
     if(event->type == InputTypeShort && event->key == InputKeyBack) {
         docview_ble_transfer_stop(app);
@@ -663,11 +663,18 @@ static bool docview_ble_transfer_input_callback(InputEvent* event, void* context
     return false;
 }
 
-static void file_select_callback(void* context, FuriString* result_path) {
+static bool file_select_callback(
+    FuriString* path,
+    void* context,
+    uint8_t** icon_ptr,
+    FuriString* filename_str) {
+    UNUSED(filename_str);
+    UNUSED(icon_ptr);
     DocviewApp* app = context;
-    if(furi_string_empty(result_path)) {
+
+    if(furi_string_empty(path)) {
         view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewSubmenu);
-        return;
+        return false;
     }
 
     with_view_model(
@@ -675,9 +682,7 @@ static void file_select_callback(void* context, FuriString* result_path) {
         DocviewReaderModel * model,
         {
             strlcpy(
-                model->document_path,
-                furi_string_get_cstr(result_path),
-                sizeof(model->document_path));
+                model->document_path, furi_string_get_cstr(path), sizeof(model->document_path));
             model->is_document_loaded = false;
             model->scroll_position = 0;
             model->h_scroll_offset = 0;
@@ -685,22 +690,30 @@ static void file_select_callback(void* context, FuriString* result_path) {
         true);
 
     view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewReader);
+    return true;
 }
 
-static void airdrop_file_select_callback(void* context, FuriString* result_path) {
+static bool airdrop_file_select_callback(
+    FuriString* path,
+    void* context,
+    uint8_t** icon_ptr,
+    FuriString* filename_str) {
+    UNUSED(filename_str);
+    UNUSED(icon_ptr);
     DocviewApp* app = context;
-    if(furi_string_empty(result_path)) {
+
+    if(furi_string_empty(path)) {
         view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewSubmenu);
-        return;
+        return false;
     }
 
     if(app->ble_state.file_path) {
         furi_string_free(app->ble_state.file_path);
     }
-    app->ble_state.file_path = furi_string_alloc_set(result_path);
+    app->ble_state.file_path = furi_string_alloc_set(path);
 
     FuriString* filename = furi_string_alloc();
-    path_extract_filename(result_path, filename, true);
+    path_extract_filename(path, filename, true);
     strlcpy(
         app->ble_state.file_name,
         furi_string_get_cstr(filename),
@@ -708,8 +721,8 @@ static void airdrop_file_select_callback(void* context, FuriString* result_path)
     furi_string_free(filename);
 
     view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewBleTransfer);
-
     docview_ble_transfer_start(app);
+    return true;
 }
 
 static void file_browser_callback(void* context) {
@@ -717,19 +730,12 @@ static void file_browser_callback(void* context) {
     view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewSubmenu);
 }
 
-static bool file_browser_custom_callback(FuriString* filename, void* context) {
-    UNUSED(context);
-    UNUSED(filename);
-
-    return true;
-}
-
 void Docview_submenu_callback(void* context, uint32_t index) {
     DocviewApp* app = context;
 
     if(index == DocviewSubmenuIndexOpenFile) {
         file_browser_stop(app->file_browser);
-        file_browser_set_filter_cb(app->file_browser, file_browser_custom_callback, app);
+        file_browser_set_callback(app->file_browser, file_browser_callback, app);
         file_browser_set_item_callback(app->file_browser, file_select_callback, app);
 
         FuriString* path = furi_string_alloc_set_str(DOCUMENTS_FOLDER_PATH);
@@ -739,7 +745,7 @@ void Docview_submenu_callback(void* context, uint32_t index) {
         view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewFileBrowser);
     } else if(index == DocviewSubmenuIndexBleAirdrop) {
         file_browser_stop(app->file_browser);
-        file_browser_set_filter_cb(app->file_browser, file_browser_custom_callback, app);
+        file_browser_set_callback(app->file_browser, file_browser_callback, app);
         file_browser_set_item_callback(app->file_browser, airdrop_file_select_callback, app);
 
         FuriString* path = furi_string_alloc_set_str(DOCUMENTS_FOLDER_PATH);
