@@ -16,35 +16,41 @@ static void* status_context = NULL;
 static FuriMutex* bt_mutex = NULL;
 
 bool bt_service_init(void) {
-    if(!bt_mutex) {
-        bt_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
-        if(!bt_mutex) return false;
-    }
+    furi_assert(!bt_mutex);
+
+    bt_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    if(!bt_mutex) return false;
 
     bool success = false;
     if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
-        bt_init(); // Initialize BT stack
-        success = bt_is_active();
-        if(success) {
+        bt_init();
+        if(bt_is_active()) {
             status_callback = NULL;
             status_context = NULL;
+            success = true;
         }
         furi_mutex_release(bt_mutex);
     }
+
+    if(!success) {
+        furi_mutex_free(bt_mutex);
+        bt_mutex = NULL;
+    }
+
     return success;
 }
 
 void bt_service_deinit(void) {
-    if(!bt_mutex) return;
+    furi_assert(bt_mutex);
 
     if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
         ble_file_service_deinit();
 
         if(status_callback) {
             status_callback(BtStatusOff, status_context);
+            status_callback = NULL;
+            status_context = NULL;
         }
-        status_callback = NULL;
-        status_context = NULL;
 
         furi_mutex_release(bt_mutex);
     }
@@ -80,13 +86,16 @@ void bt_service_unsubscribe_status(void* bt) {
 }
 
 bool ble_file_service_init(void) {
+    furi_assert(bt_mutex);
     bool success = false;
+
     if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
         if(bt_is_active()) {
             success = true;
         }
         furi_mutex_release(bt_mutex);
     }
+
     return success;
 }
 
@@ -151,9 +160,13 @@ bool ble_file_service_end_transfer(void) {
 }
 
 void ble_file_service_deinit(void) {
+    furi_assert(bt_mutex);
+
     if(bt_is_active()) {
-        // Send error packet if transfer was active
-        uint8_t error_packet[1] = {FILE_CONTROL_ERROR};
-        bt_serial_tx(error_packet, 1);
+        if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
+            uint8_t error_packet[1] = {FILE_CONTROL_ERROR};
+            bt_serial_tx(error_packet, 1);
+            furi_mutex_release(bt_mutex);
+        }
     }
 }

@@ -69,8 +69,8 @@ typedef struct {
     char file_name[64];
     FuriString* file_path;
     FuriTimer* timeout_timer;
-    FuriThread* thread;  // Add thread field
-    FuriMutex* mutex;
+    FuriThread* thread;
+    FuriMutex* mutex;  // Add mutex for BLE state protection
     bool transfer_active;
 } BleTransferState;
 
