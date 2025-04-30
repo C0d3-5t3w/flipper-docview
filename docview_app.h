@@ -78,9 +78,17 @@ typedef struct {
     bool transfer_active;
 } BleTransferState;
 
-typedef struct {
+typedef struct DocviewApp {
+    // Core resources (initialized first, freed last)
+    FuriMutex* mutex;  // Main app mutex
+    Gui* gui;          // GUI must be initialized before views
     ViewDispatcher* view_dispatcher;
-    Gui* gui;  // Add GUI pointer
+
+    // BLE state
+    BleTransferState ble_state;
+    Bt* bt;
+    
+    // Rest of the struct members
     NotificationApp* notifications;  
     Submenu* submenu;                
     TextInput* text_input;           
@@ -88,12 +96,10 @@ typedef struct {
     View* view_reader;               
     Widget* widget_about;            
     DialogsApp* dialogs;             
-    Bt* bt;                          
     Popup* popup_ble;                
     VariableItem* font_size_item;    
     char* temp_buffer;               
     uint32_t temp_buffer_size;       
-    BleTransferState ble_state;      
     FuriTimer* timer;
     FileBrowser* file_browser;
 } DocviewApp;

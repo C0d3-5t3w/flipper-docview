@@ -18,7 +18,7 @@
 
 #include "docview_app.h"
 #include "bt_service.h"
-#include "bt_hal_compat.h"
+// #include "bt_hal_compat.h"
 
 #define TAG "Docview"
 
@@ -803,27 +803,42 @@ void Docview_submenu_callback(void* context, uint32_t index) {
 
 static DocviewApp* Docview_app_alloc() {
     DocviewApp* app = malloc(sizeof(DocviewApp));
+    if(!app) return NULL;
 
-    // Initialize BT first
-    if(!bt_service_init()) {
+    // Core resources initialization
+    app->mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    if(!app->mutex) {
         free(app);
         return NULL;
     }
 
-    app->bt = NULL;
-    app->ble_state.mutex = furi_mutex_alloc(FuriMutexTypeNormal);
-    if(!app->ble_state.mutex) {
-        bt_service_deinit();
-        free(app);
-        return NULL;
-    }
-
-    // Initialize view system
+    // GUI must be initialized before view system
     app->gui = furi_record_open(RECORD_GUI);
-    app->view_dispatcher = view_dispatcher_alloc();
-    view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
-    view_dispatcher_set_event_callback_context(app->view_dispatcher, app);
+    if(!app->gui) {
+        furi_mutex_free(app->mutex);
+        free(app);
+        return NULL;
+    }
 
+    // Initialize view dispatcher
+    app->view_dispatcher = view_dispatcher_alloc();
+    if(!app->view_dispatcher) {
+        furi_record_close(RECORD_GUI);
+        furi_mutex_free(app->mutex);
+        free(app);
+        return NULL;
+    }
+
+    // Initialize BLE last
+    if(!bt_service_init()) {
+        view_dispatcher_free(app->view_dispatcher);
+        furi_record_close(RECORD_GUI);
+        furi_mutex_free(app->mutex);
+        free(app);
+        return NULL;
+    }
+
+    // Rest of initialization
     Storage* storage = furi_record_open(RECORD_STORAGE);
     if(!storage_dir_exists(storage, DOCUMENTS_FOLDER_PATH)) {
         storage_simply_mkdir(storage, DOCUMENTS_FOLDER_PATH);
@@ -940,18 +955,21 @@ static void Docview_app_free(DocviewApp* app) {
         docview_ble_transfer_stop(app);
     }
 
-    // Cleanup BT service
-    bt_service_unsubscribe_status(app->bt);
-    bt_service_deinit();
-
+    // Cleanup BLE/BT resources
     if(app->ble_state.mutex) {
+        furi_mutex_acquire(app->ble_state.mutex, FuriWaitForever);
+        bt_service_unsubscribe_status(app->bt);
+        bt_service_deinit();
+        furi_mutex_release(app->ble_state.mutex);
         furi_mutex_free(app->ble_state.mutex);
     }
 
+    // Free all remaining BLE state resources
     if(app->ble_state.file_path) {
         furi_string_free(app->ble_state.file_path);
     }
 
+    // Cleanup views in reverse order
     view_dispatcher_remove_view(app->view_dispatcher, DocviewViewBleTransfer);
     popup_free(app->popup_ble);
 
@@ -981,24 +999,49 @@ static void Docview_app_free(DocviewApp* app) {
     view_dispatcher_remove_view(app->view_dispatcher, DocviewViewFileBrowser);
     file_browser_free(app->file_browser);
 
+    // Free core resources last
+    if(app->mutex) {
+        furi_mutex_free(app->mutex);
+    }
     free(app);
 }
 
-int32_t main_Docview_app(void* _p) {
-    UNUSED(_p);
-    bt_init();
+int32_t main_Docview_app(void* p) {
+    UNUSED(p);
+    int32_t ret = 255; // Default error return
 
-    // Allocate app with safety check
+    // Check Furi system state
+    if(!furi_hal_bt_is_alive()) {
+        FURI_LOG_E(TAG, "Bluetooth system not alive");
+        return ret;
+    }
+
+    if(!furi_record_exists("bt")) {
+        FURI_LOG_E(TAG, "Bluetooth system not available");
+        return ret;
+    }
+
+    // Initialize Bluetooth stack with error handling
+    if(!bt_service_init()) {
+        FURI_LOG_E(TAG, "Failed to initialize Bluetooth");
+        return ret;
+    }
+
+    // Allocate app with error handling
     DocviewApp* app = Docview_app_alloc();
     if(!app) {
         FURI_LOG_E(TAG, "Failed to allocate application");
-        return 255;
+        bt_service_deinit();
+        return ret;
     }
 
-    // Run app
+    // Connect GUI with view dispatcher
+    view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
+
+    // Run application
     view_dispatcher_run(app->view_dispatcher);
 
-    // Cleanup
+    // Application cleanup
     Docview_app_free(app);
 
     return 0;
