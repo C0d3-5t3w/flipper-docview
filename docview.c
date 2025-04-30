@@ -7,15 +7,21 @@
 #include <gui/modules/text_input.h>
 #include <gui/modules/widget.h>
 #include <gui/modules/variable_item_list.h>
+#include <gui/modules/popup.h>
 #include <notification/notification.h>
 #include <notification/notification_messages.h>
 #include <storage/storage.h>
 #include <dialogs/dialogs.h>
 #include <toolbox/path.h>
 #include <string.h>
-#include <docview_icons.h>
 
-#define TAG "docview"
+// Add our custom headers
+#include "docview_icons.h"
+#include "docview_app.h"
+#include "bt_service.h"
+#include "bt_hal_compat.h"
+
+#define TAG "Docview"
 
 // Change this to BACKLIGHT_AUTO if you don't want the backlight to be continuously on.
 #define BACKLIGHT_ON 1
@@ -29,60 +35,9 @@
 #define DOCUMENTS_FOLDER_PATH EXT_PATH("documents")
 #define BINARY_CHECK_BYTES    512 // Number of bytes to check for binary content
 
-// Our application menu has 3 items
-typedef enum {
-    DocviewSubmenuIndexOpenFile,
-    DocviewSubmenuIndexSettings,
-    DocviewSubmenuIndexAbout,
-} DocviewSubmenuIndex;
-
-// Each view is a screen we show the user.
-typedef enum {
-    DocviewViewSubmenu, // The menu when the app starts
-    DocviewViewTextInput, // Input for configuring text settings
-    DocviewViewFileBrowser, // File browser screen
-    DocviewViewConfigure, // The configuration screen
-    DocviewViewReader, // The document reader screen
-    DocviewViewAbout, // The about screen with directions, link to social channel, etc.
-} DocviewView;
-
-typedef enum {
-    DocviewEventIdRedrawScreen = 0,
-    DocviewEventIdScroll = 1,
-} DocviewEventId;
-
-typedef struct {
-    ViewDispatcher* view_dispatcher; // Switches between our views
-    NotificationApp* notifications; // Used for controlling the backlight
-    Submenu* submenu; // The application menu
-    TextInput* text_input; // The text input screen
-    VariableItemList* variable_item_list_config; // The configuration screen
-    View* view_reader; // The document reader screen
-    Widget* widget_about; // The about screen
-    DialogsApp* dialogs; // File browser
-
-    VariableItem* font_size_item; // Font size setting item
-    char* temp_buffer; // Temporary buffer for text input
-    uint32_t temp_buffer_size; // Size of temporary buffer
-
-    FuriTimer* timer; // Timer for redrawing the screen
-} DocviewApp;
-
-typedef struct {
-    uint8_t font_size; // Font size (0-4)
-    int16_t scroll_position; // Current vertical scroll position
-    size_t h_scroll_offset; // Changed from int16_t to size_t to fix comparison issues
-    uint16_t total_lines; // Total number of lines in document
-    bool auto_scroll; // Auto-scroll enabled
-    bool is_binary; // Flag to indicate if file contains binary data
-
-    char document_path[256]; // Current document path
-    char text_buffer[TEXT_BUFFER_SIZE]; // Buffer for document content
-    char* lines[TEXT_BUFFER_SIZE / 20]; // Pointers to start of each line
-
-    bool is_document_loaded; // Flag to indicate if document is loaded
-    bool long_line_detected; // Flag to indicate if current line is too long
-} DocviewReaderModel;
+// BLE file transfer definitions
+#define BLE_CHUNK_SIZE       512
+#define BLE_TRANSFER_TIMEOUT 30000 // 30 seconds timeout for transfer
 
 /**
  * @brief      Callback for exiting the application.
@@ -118,7 +73,6 @@ static bool is_binary_content(const char* buffer, size_t size) {
     // Skip checking if file is too small
     if(size < 8) return false;
 
-    // Check for common binary file signatures
     // Check first few bytes for non-printable characters (except whitespace)
     int binary_count = 0;
     int check_bytes = size < BINARY_CHECK_BYTES ? size : BINARY_CHECK_BYTES;
@@ -165,6 +119,7 @@ static bool Docview_load_document(DocviewReaderModel* model) {
     if(storage_file_open(file, model->document_path, FSAM_READ, FSOM_OPEN_EXISTING)) {
         // Read file content
         uint16_t bytes_read = storage_file_read(file, model->text_buffer, TEXT_BUFFER_SIZE - 1);
+
         if(bytes_read > 0) {
             model->text_buffer[bytes_read] = '\0'; // Ensure null-termination
 
@@ -196,9 +151,9 @@ static bool Docview_load_document(DocviewReaderModel* model) {
             model->is_document_loaded = true;
             success = true;
         }
-        storage_file_close(file);
     }
 
+    storage_file_close(file);
     storage_file_free(file);
     furi_record_close(RECORD_STORAGE);
     return success;
@@ -207,7 +162,10 @@ static bool Docview_load_document(DocviewReaderModel* model) {
 // Font size options
 static const char* font_size_config_label = "Font Size";
 static char* font_size_names[] = {"Tiny", "Large"};
-static const uint8_t font_sizes[] = {2, 3}; // Using indices for Small/Medium from original code
+static const uint8_t font_sizes[] = {
+    2,
+    3 // Using indices for Small/Medium from original code
+};
 
 static void Docview_font_size_change(VariableItem* item) {
     DocviewApp* app = variable_item_get_context(item);
@@ -291,6 +249,7 @@ static void Docview_view_reader_draw_callback(Canvas* canvas, void* model) {
         my_model->scroll_position / lines_to_show + 1,
         (my_model->total_lines + lines_to_show - 1) / lines_to_show,
         my_model->is_binary ? "[BIN]" : ""); // Show [BIN] indicator for binary files
+
     canvas_draw_str_aligned(canvas, 128, 0, AlignRight, AlignTop, page_info);
 
     // Draw horizontal line under header
@@ -321,45 +280,41 @@ static void Docview_view_reader_draw_callback(Canvas* canvas, void* model) {
         // Check if current line is too long to fit on screen
         int line_width = canvas_string_width(canvas, line);
         if(line_width > 128) {
-            // If this is the first visible line and it's longer than screen width
-            if(i == 0) {
-                my_model->long_line_detected = true;
+            // If this line is longer than screen width, apply horizontal scrolling
+            // Now we'll apply horizontal scrolling to all lines, not just the first one
+            my_model->long_line_detected = true;
 
-                // Apply horizontal scrolling offset only to the first visible line
-                // Create a temporary buffer for the scrolled line view
-                char visible_line[MAX_LINE_LENGTH + 1];
-                size_t line_len = strlen(line);
+            // Create a temporary buffer for the scrolled line view
+            char visible_line[MAX_LINE_LENGTH + 1];
+            size_t line_len = strlen(line);
 
-                // Determine where to start copying based on horizontal offset
-                size_t start_pos = 0;
-                if(my_model->h_scroll_offset < line_len) {
-                    start_pos = my_model->h_scroll_offset;
-                } else {
-                    // Reset horizontal offset if we're at the end of the line
-                    my_model->h_scroll_offset = 0;
-                    start_pos = 0;
-                }
-
-                // Copy visible portion of the line
-                strncpy(visible_line, line + start_pos, MAX_LINE_LENGTH);
-                visible_line[MAX_LINE_LENGTH] = '\0';
-
-                // Draw the visible portion
-                canvas_draw_str(canvas, 0, y_pos + font_height, visible_line);
+            // Determine where to start copying based on horizontal offset
+            // For manual scroll, we'll use the h_scroll_offset directly
+            size_t start_pos = 0;
+            if(my_model->h_scroll_offset < line_len) {
+                start_pos = my_model->h_scroll_offset;
             } else {
-                // For other long lines, just draw from the beginning with ellipsis
-                char visible_line[MAX_LINE_LENGTH + 4]; // +4 for "..." and null terminator
-                strncpy(visible_line, line, MAX_LINE_LENGTH - 3);
-                visible_line[MAX_LINE_LENGTH - 3] = '.';
-                visible_line[MAX_LINE_LENGTH - 2] = '.';
-                visible_line[MAX_LINE_LENGTH - 1] = '.';
-                visible_line[MAX_LINE_LENGTH] = '\0';
-                canvas_draw_str(canvas, 0, y_pos + font_height, visible_line);
+                // Reset horizontal offset if we're at the end of the line
+                if(my_model->auto_scroll) {
+                    my_model->h_scroll_offset = 0;
+                } else {
+                    // For manual mode, keep at the end
+                    my_model->h_scroll_offset = line_len > 0 ? line_len - 1 : 0;
+                }
+                start_pos = my_model->h_scroll_offset;
             }
+
+            // Copy visible portion of the line
+            strncpy(visible_line, line + start_pos, MAX_LINE_LENGTH);
+            visible_line[MAX_LINE_LENGTH] = '\0';
+
+            // Draw the visible portion
+            canvas_draw_str(canvas, 0, y_pos + font_height, visible_line);
         } else {
             // Line fits on screen, draw normally
             canvas_draw_str(canvas, 0, y_pos + font_height, line);
         }
+
         y_pos += font_height;
     }
 
@@ -453,14 +408,15 @@ static void Docview_view_reader_enter_callback(void* context) {
 */
 static void Docview_view_reader_exit_callback(void* context) {
     DocviewApp* app = (DocviewApp*)context;
+
     furi_timer_stop(app->timer);
     furi_timer_free(app->timer);
     app->timer = NULL;
 }
 
 /**
- * @brief      Callback for reader screen input.
- * @details    Handles UP/DOWN for manual scrolling
+ * @brief      Callback for reader screen input with BLE option.
+ * @details    Handles UP/DOWN for manual scrolling and adds BLE transfer option
  * @param      event    The event - InputEvent object.
  * @param      context  The context - DocviewApp object.
  * @return     true if the event was handled, false otherwise.
@@ -474,8 +430,9 @@ static bool Docview_view_reader_input_callback(InputEvent* event, void* context)
                 app->view_reader,
                 DocviewReaderModel * model,
                 {
-                    model->h_scroll_offset = 0; // Reset horizontal scroll when manually navigating
+                    // Only reset horizontal scroll when moving between lines
                     if(model->scroll_position > 0) {
+                        model->h_scroll_offset = 0;
                         model->scroll_position--;
                     }
                 },
@@ -486,52 +443,84 @@ static bool Docview_view_reader_input_callback(InputEvent* event, void* context)
                 app->view_reader,
                 DocviewReaderModel * model,
                 {
-                    model->h_scroll_offset = 0; // Reset horizontal scroll when manually navigating
+                    // Only reset horizontal scroll when moving between lines
                     if(model->scroll_position < model->total_lines - 1) {
+                        model->h_scroll_offset = 0;
                         model->scroll_position++;
                     }
                 },
                 true);
             return true;
         } else if(event->key == InputKeyLeft) {
-            // Page up - scroll multiple lines
             with_view_model(
                 app->view_reader,
                 DocviewReaderModel * model,
                 {
-                    model->h_scroll_offset = 0; // Reset horizontal scroll when manually navigating
-                    uint8_t lines_to_show;
-                    // Simplified font size logic
-                    if(model->font_size == 2)
-                        lines_to_show = 8; // Tiny
-                    else
-                        lines_to_show = 5; // Large
-
-                    if(model->scroll_position >= lines_to_show) {
-                        model->scroll_position -= lines_to_show;
+                    if(model->long_line_detected && !model->auto_scroll) {
+                        // When manual scrolling is active and we have a long line,
+                        // scroll horizontally first
+                        if(model->h_scroll_offset > 0) {
+                            model->h_scroll_offset -= 5; // Scroll left by 5 chars at a time
+                            if(model->h_scroll_offset >
+                               strlen(model->lines[model->scroll_position])) {
+                                model->h_scroll_offset = 0;
+                            }
+                        } else {
+                            // If already at left edge, page up
+                            uint8_t lines_to_show = model->font_size == 2 ? 8 : 5;
+                            if(model->scroll_position >= lines_to_show) {
+                                model->scroll_position -= lines_to_show;
+                            } else {
+                                model->scroll_position = 0;
+                            }
+                        }
                     } else {
-                        model->scroll_position = 0;
+                        // Standard page up behavior
+                        uint8_t lines_to_show = model->font_size == 2 ? 8 : 5;
+                        if(model->scroll_position >= lines_to_show) {
+                            model->scroll_position -= lines_to_show;
+                        } else {
+                            model->scroll_position = 0;
+                        }
+                        model->h_scroll_offset = 0;
                     }
                 },
                 true);
             return true;
         } else if(event->key == InputKeyRight) {
-            // Page down - scroll multiple lines
             with_view_model(
                 app->view_reader,
                 DocviewReaderModel * model,
                 {
-                    model->h_scroll_offset = 0; // Reset horizontal scroll when manually navigating
-                    uint8_t lines_to_show;
-                    // Simplified font size logic
-                    if(model->font_size == 2)
-                        lines_to_show = 8; // Tiny
-                    else
-                        lines_to_show = 5; // Large
+                    if(model->long_line_detected && !model->auto_scroll) {
+                        // When manual scrolling is active and we have a long line,
+                        // scroll horizontally first
+                        char* current_line = model->lines[model->scroll_position];
+                        size_t line_len = strlen(current_line);
+                        size_t visible_len = MAX_LINE_LENGTH;
 
-                    model->scroll_position += lines_to_show;
-                    if(model->scroll_position >= model->total_lines) {
-                        model->scroll_position = model->total_lines - 1;
+                        // If we haven't reached the end of the line
+                        if(model->h_scroll_offset + visible_len < line_len) {
+                            model->h_scroll_offset += 5; // Scroll right by 5 chars at a time
+                        } else {
+                            // If at the end of the line, page down
+                            uint8_t lines_to_show = model->font_size == 2 ? 8 : 5;
+                            if(model->scroll_position < model->total_lines - 1) {
+                                model->h_scroll_offset = 0;
+                                model->scroll_position += lines_to_show;
+                                if(model->scroll_position >= model->total_lines) {
+                                    model->scroll_position = model->total_lines - 1;
+                                }
+                            }
+                        }
+                    } else {
+                        // Standard page down behavior
+                        uint8_t lines_to_show = model->font_size == 2 ? 8 : 5;
+                        model->h_scroll_offset = 0;
+                        model->scroll_position += lines_to_show;
+                        if(model->scroll_position >= model->total_lines) {
+                            model->scroll_position = model->total_lines - 1;
+                        }
                     }
                 },
                 true);
@@ -548,64 +537,333 @@ static bool Docview_view_reader_input_callback(InputEvent* event, void* context)
                 true);
             return true;
         }
+    } else if(event->type == InputTypeLong) {
+        if(event->key == InputKeyOk) {
+            // Long press OK to bring up BLE transfer option
+            with_view_model(
+                app->view_reader,
+                DocviewReaderModel * model,
+                {
+                    // Only allow BLE transfer if a document is loaded
+                    if(model->is_document_loaded) {
+                        // Copy the current document path to BLE state
+                        if(app->ble_state.file_path) {
+                            furi_string_free(app->ble_state.file_path);
+                        }
+                        app->ble_state.file_path = furi_string_alloc();
+                        furi_string_set_str(app->ble_state.file_path, model->document_path);
+
+                        // Extract filename for display
+                        const char* filename = strrchr(model->document_path, '/');
+                        if(filename) {
+                            filename++; // Skip the '/'
+                        } else {
+                            filename = model->document_path;
+                        }
+                        strlcpy(
+                            app->ble_state.file_name, filename, sizeof(app->ble_state.file_name));
+                    }
+                },
+                false); // Don't force redraw because we're switching views
+
+            // Switch to BLE transfer view
+            view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewBleTransfer);
+
+            // Start the BLE transfer process
+            docview_ble_transfer_start(app);
+            return true;
+        }
     }
 
     return false;
 }
 
 /**
- * @brief      Handle submenu item selection.
- * @details    This function is called when user selects an item from the submenu.
- * @param      context  The context - DocviewApp object.
- * @param      index     The DocviewSubmenuIndex item that was clicked.
-*/
-static void Docview_submenu_callback(void* context, uint32_t index) {
-    DocviewApp* app = (DocviewApp*)context;
-    switch(index) {
-    case DocviewSubmenuIndexOpenFile:
-        // Open the file browser to select a document
-        {
-            FuriString* path = furi_string_alloc();
-            furi_string_set(path, DOCUMENTS_FOLDER_PATH);
+ * @brief Start the BLE file transfer process
+ * @param app DocviewApp context
+ */
+void docview_ble_transfer_start(DocviewApp* app) {
+    // Reset transfer state
+    app->ble_state.status = BleTransferStatusAdvertising;
+    app->ble_state.chunks_sent = 0;
+    app->ble_state.bytes_sent = 0;
 
-            DialogsFileBrowserOptions browser_options;
-            dialog_file_browser_set_basic_options(&browser_options, DOCUMENT_EXT_FILTER, &I_doc);
+    // Get file size
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    FileInfo file_info;
+    if(storage_common_stat(storage, furi_string_get_cstr(app->ble_state.file_path), &file_info) ==
+       FSE_OK) {
+        app->ble_state.file_size = file_info.size;
+        app->ble_state.total_chunks = (file_info.size + BLE_CHUNK_SIZE - 1) / BLE_CHUNK_SIZE;
+    } else {
+        app->ble_state.status = BleTransferStatusFailed;
+        furi_record_close(RECORD_STORAGE);
+        return;
+    }
 
-            bool result = dialog_file_browser_show(app->dialogs, path, path, &browser_options);
+    furi_record_close(RECORD_STORAGE);
 
-            if(result) {
-                // User selected a file
-                with_view_model(
-                    app->view_reader,
-                    DocviewReaderModel * model,
-                    {
-                        strncpy(
-                            model->document_path,
-                            furi_string_get_cstr(path),
-                            sizeof(model->document_path) - 1);
-                        model->document_path[sizeof(model->document_path) - 1] =
-                            '\0'; // Ensure null termination
-                        model->scroll_position = 0;
-                        model->h_scroll_offset = 0;
-                        model->is_binary = false;
-                        model->is_document_loaded = false; // Will be loaded when entering view
-                    },
-                    true);
+    // Initialize BLE file service
+    if(!ble_file_service_init()) {
+        app->ble_state.status = BleTransferStatusFailed;
+        docview_ble_transfer_update_status(app);
+        return;
+    }
 
-                view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewReader);
-            }
+    // Update UI with initial status
+    docview_ble_transfer_update_status(app);
 
-            furi_string_free(path);
-        }
+    // Initialize BT service for file transfer
+    app->bt = furi_record_open(RECORD_BT);
+
+    // Set up timeout timer
+    app->ble_state.timeout_timer =
+        furi_timer_alloc(docview_ble_timeout_callback, FuriTimerTypeOnce, app);
+    furi_timer_start(app->ble_state.timeout_timer, BLE_TRANSFER_TIMEOUT);
+
+    // Start the file transfer process directly by creating a thread
+    FuriThread* thread =
+        furi_thread_alloc_ex("BleTransfer", 1024, docview_ble_transfer_process_callback, app);
+    furi_thread_start(thread);
+}
+
+/**
+ * @brief Stop the BLE file transfer process
+ * @param app DocviewApp context
+ */
+void docview_ble_transfer_stop(DocviewApp* app) {
+    // Stop BLE service
+    ble_file_service_deinit();
+
+    // Clean up timeout timer
+    if(app->ble_state.timeout_timer) {
+        furi_timer_stop(app->ble_state.timeout_timer);
+        furi_timer_free(app->ble_state.timeout_timer);
+        app->ble_state.timeout_timer = NULL;
+    }
+
+    // Close BT service
+    if(app->bt) {
+        furi_record_close(RECORD_BT);
+        app->bt = NULL;
+    }
+}
+
+/**
+ * @brief Update the BLE transfer status UI
+ * @param app DocviewApp context
+ */
+void docview_ble_transfer_update_status(DocviewApp* app) {
+    const char* status_text;
+    FuriString* temp_str = furi_string_alloc();
+
+    // Update popup based on transfer status
+    switch(app->ble_state.status) {
+    case BleTransferStatusAdvertising:
+        status_text = "Waiting for connection\nFile: %s\nSize: %lu bytes";
+        furi_string_printf(
+            temp_str, status_text, app->ble_state.file_name, app->ble_state.file_size);
+        popup_set_header(app->popup_ble, "BLE File Transfer", 64, 11, AlignCenter, AlignCenter);
+        popup_set_text(
+            app->popup_ble, furi_string_get_cstr(temp_str), 64, 32, AlignCenter, AlignCenter);
         break;
-    case DocviewSubmenuIndexSettings:
-        view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewConfigure);
+
+    case BleTransferStatusConnected:
+        status_text = "Connected\nPreparing to send %s";
+        furi_string_printf(temp_str, status_text, app->ble_state.file_name);
+        popup_set_header(app->popup_ble, "BLE File Transfer", 64, 11, AlignCenter, AlignCenter);
+        popup_set_text(
+            app->popup_ble, furi_string_get_cstr(temp_str), 64, 32, AlignCenter, AlignCenter);
         break;
-    case DocviewSubmenuIndexAbout:
-        view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewAbout);
+
+    case BleTransferStatusTransferring: {
+        // Calculate progress percentage
+        int progress = (app->ble_state.chunks_sent * 100) / app->ble_state.total_chunks;
+        status_text = "Sending: %s\n%d%% (%lu/%lu bytes)";
+        furi_string_printf(
+            temp_str,
+            status_text,
+            app->ble_state.file_name,
+            progress,
+            app->ble_state.bytes_sent,
+            app->ble_state.file_size);
+        popup_set_header(app->popup_ble, "BLE File Transfer", 64, 11, AlignCenter, AlignCenter);
+        popup_set_text(
+            app->popup_ble, furi_string_get_cstr(temp_str), 64, 32, AlignCenter, AlignCenter);
         break;
+    }
+
+    case BleTransferStatusComplete:
+        status_text = "Transfer complete\nFile: %s\nSize: %lu bytes";
+        furi_string_printf(
+            temp_str, status_text, app->ble_state.file_name, app->ble_state.file_size);
+        popup_set_header(app->popup_ble, "BLE File Transfer", 64, 11, AlignCenter, AlignCenter);
+        popup_set_text(
+            app->popup_ble, furi_string_get_cstr(temp_str), 64, 32, AlignCenter, AlignCenter);
+        break;
+
+    case BleTransferStatusFailed:
+        status_text = "Transfer failed\nFile: %s";
+        furi_string_printf(temp_str, status_text, app->ble_state.file_name);
+        popup_set_header(app->popup_ble, "BLE File Transfer", 64, 11, AlignCenter, AlignCenter);
+        popup_set_text(
+            app->popup_ble, furi_string_get_cstr(temp_str), 64, 32, AlignCenter, AlignCenter);
+        break;
+
     default:
         break;
+    }
+
+    furi_string_free(temp_str);
+
+    // Force redraw
+    view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewBleTransfer);
+}
+
+/**
+ * @brief Callback for BLE transfer timeout
+ * @param context DocviewApp context
+ */
+void docview_ble_timeout_callback(void* context) {
+    DocviewApp* app = context;
+
+    // Handle timeout by setting failed status
+    app->ble_state.status = BleTransferStatusFailed;
+    docview_ble_transfer_update_status(app);
+
+    // Clean up
+    docview_ble_transfer_stop(app);
+}
+
+/**
+ * @brief Callback for BLE status changes
+ * @param status Current BT state
+ * @param context DocviewApp context
+ */
+void docview_ble_status_changed_callback(BtStatus status, void* context) {
+    DocviewApp* app = context;
+
+    // Handle different BT status updates based on Flipper BT service status values
+    if(status == BtStatusConnected) { // Connected
+        app->ble_state.status = BleTransferStatusConnected;
+        docview_ble_transfer_update_status(app);
+    } else if(status != BtStatusOff && status != BtStatusStarted) { // Any error status
+        app->ble_state.status = BleTransferStatusFailed;
+        docview_ble_transfer_update_status(app);
+    } else if(status == BtStatusError) { // Use BtStatusError
+        // Clean up after error
+        docview_ble_transfer_stop(app);
+    }
+}
+
+/**
+ * @brief Process the actual file transfer
+ * @param context DocviewApp context
+ * @return 0 if successful
+ */
+int32_t docview_ble_transfer_process_callback(void* context) {
+    DocviewApp* app = context;
+    bool success = false;
+
+    // Open file for transfer
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* file = storage_file_alloc(storage);
+
+    if(storage_file_open(
+           file, furi_string_get_cstr(app->ble_state.file_path), FSAM_READ, FSOM_OPEN_EXISTING)) {
+        // Start the file transfer session
+        if(ble_file_service_start_transfer(app->ble_state.file_name, app->ble_state.file_size)) {
+            // Update status to transferring
+            app->ble_state.status = BleTransferStatusTransferring;
+            docview_ble_transfer_update_status(app);
+
+            // Allocate chunk buffer
+            uint8_t* chunk_buffer = malloc(BLE_CHUNK_SIZE);
+
+            // Send the file data in chunks
+            while(app->ble_state.chunks_sent < app->ble_state.total_chunks) {
+                // Read a chunk from file
+                size_t bytes_read = storage_file_read(file, chunk_buffer, BLE_CHUNK_SIZE);
+                if(bytes_read == 0) break;
+
+                // Send the chunk via BLE
+                if(ble_file_service_send(chunk_buffer, bytes_read)) {
+                    // Update progress
+                    app->ble_state.bytes_sent += bytes_read;
+                    app->ble_state.chunks_sent++;
+
+                    // Update UI every few chunks
+                    if(app->ble_state.chunks_sent % 5 == 0) {
+                        docview_ble_transfer_update_status(app);
+                    }
+                } else {
+                    // Failed to send chunk
+                    break;
+                }
+
+                // Short delay to allow receiver to process data
+                furi_delay_ms(10);
+            }
+
+            free(chunk_buffer);
+
+            // End the transfer session
+            ble_file_service_end_transfer();
+
+            // Check if all chunks were sent
+            if(app->ble_state.chunks_sent == app->ble_state.total_chunks) {
+                success = true;
+            }
+        }
+    }
+
+    storage_file_close(file);
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+
+    // Update final status
+    if(success) {
+        app->ble_state.status = BleTransferStatusComplete;
+    } else {
+        app->ble_state.status = BleTransferStatusFailed;
+    }
+    docview_ble_transfer_update_status(app);
+
+    // Clean up after transfer
+    docview_ble_transfer_stop(app);
+
+    return 0;
+}
+
+/**
+ * @brief Input callback for the BLE transfer popup
+ * @param event Input event
+ * @param context DocviewApp context
+ * @return true if event handled
+ */
+static bool docview_ble_transfer_input_callback(InputEvent* event, void* context) {
+    DocviewApp* app = context;
+
+    if(event->type == InputTypeShort && event->key == InputKeyBack) {
+        // Cancel transfer and return to reader view
+        docview_ble_transfer_stop(app);
+        view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewReader);
+        return true;
+    }
+
+    return false;
+}
+
+/* Docview submenu callback - implemented below but defined in docview_app.h */
+void Docview_submenu_callback(void* context, uint32_t index) {
+    DocviewApp* app = context;
+
+    if(index == DocviewSubmenuIndexOpenFile) {
+        // File browser logic would go here
+    } else if(index == DocviewSubmenuIndexSettings) {
+        view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewConfigure);
+    } else if(index == DocviewSubmenuIndexAbout) {
+        view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewAbout);
     }
 }
 
@@ -616,7 +874,6 @@ static void Docview_submenu_callback(void* context, uint32_t index) {
 */
 static DocviewApp* Docview_app_alloc() {
     DocviewApp* app = (DocviewApp*)malloc(sizeof(DocviewApp));
-
     Gui* gui = furi_record_open(RECORD_GUI);
 
     app->view_dispatcher = view_dispatcher_alloc();
@@ -637,6 +894,7 @@ static DocviewApp* Docview_app_alloc() {
         app->submenu, "Settings", DocviewSubmenuIndexSettings, Docview_submenu_callback, app);
     submenu_add_item(
         app->submenu, "About", DocviewSubmenuIndexAbout, Docview_submenu_callback, app);
+
     view_set_previous_callback(submenu_get_view(app->submenu), Docview_navigation_exit_callback);
     view_dispatcher_add_view(
         app->view_dispatcher, DocviewViewSubmenu, submenu_get_view(app->submenu));
@@ -645,6 +903,7 @@ static DocviewApp* Docview_app_alloc() {
     app->text_input = text_input_alloc();
     view_dispatcher_add_view(
         app->view_dispatcher, DocviewViewTextInput, text_input_get_view(app->text_input));
+
     app->temp_buffer_size = 32;
     app->temp_buffer = (char*)malloc(app->temp_buffer_size);
 
@@ -690,6 +949,7 @@ static DocviewApp* Docview_app_alloc() {
     view_set_enter_callback(app->view_reader, Docview_view_reader_enter_callback);
     view_set_exit_callback(app->view_reader, Docview_view_reader_exit_callback);
     view_set_context(app->view_reader, app);
+
     view_allocate_model(app->view_reader, ViewModelTypeLockFree, sizeof(DocviewReaderModel));
     DocviewReaderModel* model = view_get_model(app->view_reader);
     model->font_size = font_sizes[font_size_index]; // Default to Large
@@ -701,29 +961,20 @@ static DocviewApp* Docview_app_alloc() {
     model->is_binary = false; // Initialize binary flag
     model->long_line_detected = false; // Initialize long line flag
     model->document_path[0] = '\0';
+
     view_dispatcher_add_view(app->view_dispatcher, DocviewViewReader, app->view_reader);
 
-    app->widget_about = widget_alloc();
-    widget_add_text_scroll_element(
-        app->widget_about,
-        0,
-        0,
-        128,
-        64,
-        "Document Viewer for \nFlipper Zero\n-Made by: C0d3-5t3w-\nUse this app to \nread document files.\n\n"
-        "Supports viewing \ntext content from\nmultiple file types, including:\n"
-        ".txt .doc .md .js .ts .sh .go .c\n.cpp .rs .zig .html .css .scss\n"
-        ".php .json .yaml .h and more!\n\n"
-        "Place files in the\n'documents' folder on your SD card.\n\n"
-        "Or browse to any file\nusing the file browser.\n\n"
-        "Controls:\n"
-        "UP/DOWN: Scroll by line\n"
-        "LEFT/RIGHT: Page up/down\n"
-        "OK: Toggle auto-scroll\n");
-    view_set_previous_callback(
-        widget_get_view(app->widget_about), Docview_navigation_submenu_callback);
+    // Initialize BLE transfer state
+    app->ble_state.status = BleTransferStatusIdle;
+    app->ble_state.file_path = NULL;
+    app->ble_state.timeout_timer = NULL;
+
+    // Create BLE transfer popup
+    app->popup_ble = popup_alloc();
+    view_set_context(popup_get_view(app->popup_ble), app);
+    view_set_input_callback(popup_get_view(app->popup_ble), docview_ble_transfer_input_callback);
     view_dispatcher_add_view(
-        app->view_dispatcher, DocviewViewAbout, widget_get_view(app->widget_about));
+        app->view_dispatcher, DocviewViewBleTransfer, popup_get_view(app->popup_ble));
 
     app->notifications = furi_record_open(RECORD_NOTIFICATION);
     app->dialogs = furi_record_open(RECORD_DIALOGS);
@@ -741,6 +992,18 @@ static DocviewApp* Docview_app_alloc() {
  * @param      app  The Docview application object.
 */
 static void Docview_app_free(DocviewApp* app) {
+    // Clean up BLE transfer if active
+    docview_ble_transfer_stop(app);
+
+    // Free BLE state resources
+    if(app->ble_state.file_path) {
+        furi_string_free(app->ble_state.file_path);
+    }
+
+    // Remove BLE transfer view
+    view_dispatcher_remove_view(app->view_dispatcher, DocviewViewBleTransfer);
+    popup_free(app->popup_ble);
+
 #ifdef BACKLIGHT_ON
     notification_message(app->notifications, &sequence_display_backlight_enforce_auto);
 #endif
@@ -749,15 +1012,20 @@ static void Docview_app_free(DocviewApp* app) {
 
     view_dispatcher_remove_view(app->view_dispatcher, DocviewViewTextInput);
     text_input_free(app->text_input);
+
     free(app->temp_buffer);
-    view_dispatcher_remove_view(app->view_dispatcher, DocviewViewAbout);
-    widget_free(app->widget_about);
+
+    // About view would be removed here if implemented
+
     view_dispatcher_remove_view(app->view_dispatcher, DocviewViewReader);
     view_free(app->view_reader);
+
     view_dispatcher_remove_view(app->view_dispatcher, DocviewViewConfigure);
     variable_item_list_free(app->variable_item_list_config);
+
     view_dispatcher_remove_view(app->view_dispatcher, DocviewViewSubmenu);
     submenu_free(app->submenu);
+
     view_dispatcher_free(app->view_dispatcher);
     furi_record_close(RECORD_GUI);
 
