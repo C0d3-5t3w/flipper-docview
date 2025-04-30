@@ -12,6 +12,7 @@
 #include <storage/storage.h>
 #include <dialogs/dialogs.h>
 #include <toolbox/path.h>
+#include <string.h>
 #include <docview_icons.h>
 
 #define TAG "docview"
@@ -23,8 +24,10 @@
 #define TEXT_BUFFER_SIZE      4096
 #define LINES_ON_SCREEN       6
 #define MAX_LINE_LENGTH       128
-#define DOCUMENT_EXTENSION    ".txt"
+// Supporting multiple file types - wildcard for all files
+#define DOCUMENT_EXT_FILTER   "*"
 #define DOCUMENTS_FOLDER_PATH EXT_PATH("documents")
+#define BINARY_CHECK_BYTES    512 // Number of bytes to check for binary content
 
 // Our application menu has 3 items
 typedef enum {
@@ -66,16 +69,19 @@ typedef struct {
 } DocviewApp;
 
 typedef struct {
-    uint8_t font_size; // Font size (1-3)
-    int16_t scroll_position; // Current scroll position
+    uint8_t font_size; // Font size (0-4)
+    int16_t scroll_position; // Current vertical scroll position
+    size_t h_scroll_offset; // Changed from int16_t to size_t to fix comparison issues
     uint16_t total_lines; // Total number of lines in document
     bool auto_scroll; // Auto-scroll enabled
+    bool is_binary; // Flag to indicate if file contains binary data
 
     char document_path[256]; // Current document path
     char text_buffer[TEXT_BUFFER_SIZE]; // Buffer for document content
     char* lines[TEXT_BUFFER_SIZE / 20]; // Pointers to start of each line
 
     bool is_document_loaded; // Flag to indicate if document is loaded
+    bool long_line_detected; // Flag to indicate if current line is too long
 } DocviewReaderModel;
 
 /**
@@ -103,56 +109,48 @@ static uint32_t Docview_navigation_submenu_callback(void* _context) {
 }
 
 /**
- * @brief      Handle submenu item selection.
- * @details    This function is called when user selects an item from the submenu.
- * @param      context  The context - DocviewApp object.
- * @param      index     The DocviewSubmenuIndex item that was clicked.
-*/
-static void Docview_submenu_callback(void* context, uint32_t index) {
-    DocviewApp* app = (DocviewApp*)context;
-    switch(index) {
-    case DocviewSubmenuIndexOpenFile:
-        // Open the file browser to select a document
-        {
-            FuriString* path = furi_string_alloc();
-            furi_string_set(path, DOCUMENTS_FOLDER_PATH);
+ * @brief Check if file appears to be binary
+ * @param buffer Buffer containing file content
+ * @param size Size of the buffer
+ * @return true if file appears to be binary, false otherwise
+ */
+static bool is_binary_content(const char* buffer, size_t size) {
+    // Skip checking if file is too small
+    if(size < 8) return false;
 
-            DialogsFileBrowserOptions browser_options;
-            dialog_file_browser_set_basic_options(&browser_options, DOCUMENT_EXTENSION, &I_doc);
+    // Check for common binary file signatures
+    // Check first few bytes for non-printable characters (except whitespace)
+    int binary_count = 0;
+    int check_bytes = size < BINARY_CHECK_BYTES ? size : BINARY_CHECK_BYTES;
 
-            bool result = dialog_file_browser_show(app->dialogs, path, path, &browser_options);
-
-            if(result) {
-                // User selected a file
-                with_view_model(
-                    app->view_reader,
-                    DocviewReaderModel * model,
-                    {
-                        strncpy(
-                            model->document_path,
-                            furi_string_get_cstr(path),
-                            sizeof(model->document_path) - 1);
-                        model->document_path[sizeof(model->document_path) - 1] =
-                            '\0'; // Ensure null termination
-                        model->scroll_position = 0;
-                        model->is_document_loaded = false; // Will be loaded when entering view
-                    },
-                    true);
-
-                view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewReader);
-            }
-
-            furi_string_free(path);
+    for(int i = 0; i < check_bytes; i++) {
+        char c = buffer[i];
+        // Skip carriage return, newline, tab and space
+        if(c == '\r' || c == '\n' || c == '\t' || c == ' ') {
+            continue;
         }
-        break;
-    case DocviewSubmenuIndexSettings:
-        view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewConfigure);
-        break;
-    case DocviewSubmenuIndexAbout:
-        view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewAbout);
-        break;
-    default:
-        break;
+        // If not printable ASCII, count as binary
+        if(c < 32 || c > 126) {
+            binary_count++;
+        }
+    }
+
+    // If more than 10% of checked content is non-printable, consider it binary
+    return (binary_count > (check_bytes / 10));
+}
+
+/**
+ * @brief Clean binary data for text display
+ * @param buffer Buffer containing file content
+ * @param size Size of the buffer
+ */
+static void clean_binary_content(char* buffer, size_t size) {
+    for(size_t i = 0; i < size; i++) {
+        // Replace non-printable characters with a placeholder
+        if((buffer[i] < 32 || buffer[i] > 126) && buffer[i] != '\r' && buffer[i] != '\n' &&
+           buffer[i] != '\t') {
+            buffer[i] = '.';
+        }
     }
 }
 
@@ -169,6 +167,14 @@ static bool Docview_load_document(DocviewReaderModel* model) {
         uint16_t bytes_read = storage_file_read(file, model->text_buffer, TEXT_BUFFER_SIZE - 1);
         if(bytes_read > 0) {
             model->text_buffer[bytes_read] = '\0'; // Ensure null-termination
+
+            // Check if this appears to be a binary file
+            model->is_binary = is_binary_content(model->text_buffer, bytes_read);
+
+            // If binary, clean the content for display
+            if(model->is_binary) {
+                clean_binary_content(model->text_buffer, bytes_read);
+            }
 
             // Split text into lines
             model->total_lines = 0;
@@ -201,8 +207,7 @@ static bool Docview_load_document(DocviewReaderModel* model) {
 // Font size options
 static const char* font_size_config_label = "Font Size";
 static char* font_size_names[] = {"Very Very Small", "Very Small", "Small", "Medium", "Large"};
-static const float font_sizes[] =
-    {0.1, 0.5, 1.5, 2.0, 2.5}; // Corresponds to font height multipliers
+static const uint8_t font_sizes[] = {0, 1, 2, 3, 4}; // Integer indices for font sizes
 
 static void Docview_font_size_change(VariableItem* item) {
     DocviewApp* app = variable_item_get_context(item);
@@ -245,6 +250,9 @@ static void Docview_view_reader_draw_callback(Canvas* canvas, void* model) {
     }
 
     uint8_t font_height;
+    canvas_set_color(canvas, ColorBlack);
+
+    // Select font and set appropriate line height based on font size
     switch(my_model->font_size) {
     case 0: // Very Very Small
         canvas_set_font(canvas, FontSecondary);
@@ -269,13 +277,11 @@ static void Docview_view_reader_draw_callback(Canvas* canvas, void* model) {
         break;
     }
 
-    // Display the document content
-    int16_t y_pos = 0;
-    uint8_t lines_to_show = 64 / font_height;
+    // Calculate how many lines can fit on screen
+    uint8_t lines_to_show = (64 - 10) / font_height; // 10px for header
 
     // Draw header with file info
     canvas_set_font(canvas, FontSecondary);
-    canvas_set_color(canvas, ColorBlack);
 
     // Get just the filename from the path
     const char* filename = strrchr(my_model->document_path, '/');
@@ -293,17 +299,20 @@ static void Docview_view_reader_draw_callback(Canvas* canvas, void* model) {
     snprintf(
         page_info,
         sizeof(page_info),
-        "%d/%d",
+        "%d/%d %s",
         my_model->scroll_position / lines_to_show + 1,
-        (my_model->total_lines + lines_to_show - 1) / lines_to_show);
+        (my_model->total_lines + lines_to_show - 1) / lines_to_show,
+        my_model->is_binary ? "[BIN]" : ""); // Show [BIN] indicator for binary files
     canvas_draw_str_aligned(canvas, 128, 0, AlignRight, AlignTop, page_info);
 
     // Draw horizontal line under header
     canvas_draw_line(canvas, 0, 9, 128, 9);
 
-    // Set font for content display
+    // Set font for content display based on selected font size
     switch(my_model->font_size) {
     case 0:
+    case 1:
+    case 2:
         canvas_set_font(canvas, FontSecondary);
         break;
     case 4:
@@ -316,13 +325,58 @@ static void Docview_view_reader_draw_callback(Canvas* canvas, void* model) {
     }
 
     // Start drawing from y=10 (below the header)
-    y_pos = 10;
+    int16_t y_pos = 10;
+
+    // Flag to track if we have a long line that needs horizontal scrolling
+    my_model->long_line_detected = false;
 
     // Draw document content
     for(int i = 0; i < lines_to_show && (i + my_model->scroll_position) < my_model->total_lines;
         i++) {
-        canvas_draw_str(
-            canvas, 0, y_pos + font_height, my_model->lines[i + my_model->scroll_position]);
+        char* line = my_model->lines[i + my_model->scroll_position];
+
+        // Check if current line is too long to fit on screen
+        int line_width = canvas_string_width(canvas, line);
+        if(line_width > 128) {
+            // If this is the first visible line and it's longer than screen width
+            if(i == 0) {
+                my_model->long_line_detected = true;
+
+                // Apply horizontal scrolling offset only to the first visible line
+                // Create a temporary buffer for the scrolled line view
+                char visible_line[MAX_LINE_LENGTH + 1];
+                size_t line_len = strlen(line);
+
+                // Determine where to start copying based on horizontal offset
+                size_t start_pos = 0;
+                if(my_model->h_scroll_offset < line_len) {
+                    start_pos = my_model->h_scroll_offset;
+                } else {
+                    // Reset horizontal offset if we're at the end of the line
+                    my_model->h_scroll_offset = 0;
+                    start_pos = 0;
+                }
+
+                // Copy visible portion of the line
+                strncpy(visible_line, line + start_pos, MAX_LINE_LENGTH);
+                visible_line[MAX_LINE_LENGTH] = '\0';
+
+                // Draw the visible portion
+                canvas_draw_str(canvas, 0, y_pos + font_height, visible_line);
+            } else {
+                // For other long lines, just draw from the beginning with ellipsis
+                char visible_line[MAX_LINE_LENGTH + 4]; // +4 for "..." and null terminator
+                strncpy(visible_line, line, MAX_LINE_LENGTH - 3);
+                visible_line[MAX_LINE_LENGTH - 3] = '.';
+                visible_line[MAX_LINE_LENGTH - 2] = '.';
+                visible_line[MAX_LINE_LENGTH - 1] = '.';
+                visible_line[MAX_LINE_LENGTH] = '\0';
+                canvas_draw_str(canvas, 0, y_pos + font_height, visible_line);
+            }
+        } else {
+            // Line fits on screen, draw normally
+            canvas_draw_str(canvas, 0, y_pos + font_height, line);
+        }
         y_pos += font_height;
     }
 
@@ -331,14 +385,18 @@ static void Docview_view_reader_draw_callback(Canvas* canvas, void* model) {
         canvas_draw_str_aligned(canvas, 64, 32, AlignCenter, AlignCenter, "Empty document");
     }
 
-    // Show navigation hints at the bottom
+    // Show auto-scroll indicator if enabled
     canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str_aligned(canvas, 64, 64, AlignCenter, AlignBottom, "<3");
+    if(my_model->auto_scroll) {
+        canvas_draw_str_aligned(canvas, 64, 64, AlignCenter, AlignBottom, "AUTO ⏬");
+    } else {
+        canvas_draw_str_aligned(canvas, 64, 64, AlignCenter, AlignBottom, "⬆️⬇️");
+    }
 }
 
 /**
  * @brief      Callback for timer elapsed.
- * @details    Used for auto-scroll feature
+ * @details    Used for auto-scroll feature for both vertical and horizontal scrolling
  * @param      context  The context - DocviewApp object.
 */
 static void Docview_view_reader_timer_callback(void* context) {
@@ -349,8 +407,31 @@ static void Docview_view_reader_timer_callback(void* context) {
         DocviewReaderModel * model,
         {
             if(model->auto_scroll && model->is_document_loaded) {
-                if(model->scroll_position < model->total_lines - 1) {
-                    model->scroll_position++;
+                // Handle horizontal scrolling for long lines first
+                if(model->long_line_detected) {
+                    // Get the current line
+                    if(model->scroll_position < model->total_lines) {
+                        char* current_line = model->lines[model->scroll_position];
+                        size_t line_len = strlen(current_line);
+
+                        // Advance horizontal scroll position
+                        model->h_scroll_offset += 2; // Scroll by 2 characters at a time
+
+                        // If we've scrolled to the end of the line
+                        if(model->h_scroll_offset > line_len) {
+                            // Reset horizontal scroll and move to next line
+                            model->h_scroll_offset = 0;
+                            if(model->scroll_position < model->total_lines - 1) {
+                                model->scroll_position++;
+                            }
+                        }
+                    }
+                } else {
+                    // No long line, just do vertical scrolling
+                    model->h_scroll_offset = 0; // Reset horizontal offset
+                    if(model->scroll_position < model->total_lines - 1) {
+                        model->scroll_position++;
+                    }
                 }
             }
         },
@@ -410,6 +491,7 @@ static bool Docview_view_reader_input_callback(InputEvent* event, void* context)
                 app->view_reader,
                 DocviewReaderModel * model,
                 {
+                    model->h_scroll_offset = 0; // Reset horizontal scroll when manually navigating
                     if(model->scroll_position > 0) {
                         model->scroll_position--;
                     }
@@ -421,6 +503,7 @@ static bool Docview_view_reader_input_callback(InputEvent* event, void* context)
                 app->view_reader,
                 DocviewReaderModel * model,
                 {
+                    model->h_scroll_offset = 0; // Reset horizontal scroll when manually navigating
                     if(model->scroll_position < model->total_lines - 1) {
                         model->scroll_position++;
                     }
@@ -433,7 +516,9 @@ static bool Docview_view_reader_input_callback(InputEvent* event, void* context)
                 app->view_reader,
                 DocviewReaderModel * model,
                 {
+                    model->h_scroll_offset = 0; // Reset horizontal scroll when manually navigating
                     uint8_t lines_to_show;
+                    // Use the font_size as direct index now (0-4)
                     if(model->font_size == 0)
                         lines_to_show = 12; // Very Very Small
                     else if(model->font_size == 1)
@@ -459,7 +544,9 @@ static bool Docview_view_reader_input_callback(InputEvent* event, void* context)
                 app->view_reader,
                 DocviewReaderModel * model,
                 {
+                    model->h_scroll_offset = 0; // Reset horizontal scroll when manually navigating
                     uint8_t lines_to_show;
+                    // Use the font_size as direct index now (0-4)
                     if(model->font_size == 0)
                         lines_to_show = 12; // Very Very Small
                     else if(model->font_size == 1)
@@ -483,13 +570,72 @@ static bool Docview_view_reader_input_callback(InputEvent* event, void* context)
             with_view_model(
                 app->view_reader,
                 DocviewReaderModel * model,
-                { model->auto_scroll = !model->auto_scroll; },
+                {
+                    model->auto_scroll = !model->auto_scroll;
+                    model->h_scroll_offset = 0; // Reset horizontal position when toggling
+                },
                 true);
             return true;
         }
     }
 
     return false;
+}
+
+/**
+ * @brief      Handle submenu item selection.
+ * @details    This function is called when user selects an item from the submenu.
+ * @param      context  The context - DocviewApp object.
+ * @param      index     The DocviewSubmenuIndex item that was clicked.
+*/
+static void Docview_submenu_callback(void* context, uint32_t index) {
+    DocviewApp* app = (DocviewApp*)context;
+    switch(index) {
+    case DocviewSubmenuIndexOpenFile:
+        // Open the file browser to select a document
+        {
+            FuriString* path = furi_string_alloc();
+            furi_string_set(path, DOCUMENTS_FOLDER_PATH);
+
+            DialogsFileBrowserOptions browser_options;
+            dialog_file_browser_set_basic_options(&browser_options, DOCUMENT_EXT_FILTER, &I_doc);
+
+            bool result = dialog_file_browser_show(app->dialogs, path, path, &browser_options);
+
+            if(result) {
+                // User selected a file
+                with_view_model(
+                    app->view_reader,
+                    DocviewReaderModel * model,
+                    {
+                        strncpy(
+                            model->document_path,
+                            furi_string_get_cstr(path),
+                            sizeof(model->document_path) - 1);
+                        model->document_path[sizeof(model->document_path) - 1] =
+                            '\0'; // Ensure null termination
+                        model->scroll_position = 0;
+                        model->h_scroll_offset = 0;
+                        model->is_binary = false;
+                        model->is_document_loaded = false; // Will be loaded when entering view
+                    },
+                    true);
+
+                view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewReader);
+            }
+
+            furi_string_free(path);
+        }
+        break;
+    case DocviewSubmenuIndexSettings:
+        view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewConfigure);
+        break;
+    case DocviewSubmenuIndexAbout:
+        view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewAbout);
+        break;
+    default:
+        break;
+    }
 }
 
 /**
@@ -577,9 +723,12 @@ static DocviewApp* Docview_app_alloc() {
     DocviewReaderModel* model = view_get_model(app->view_reader);
     model->font_size = font_sizes[font_size_index];
     model->scroll_position = 0;
+    model->h_scroll_offset = 0; // Initialize horizontal scroll offset
     model->auto_scroll = (auto_scroll_index == 1);
     model->is_document_loaded = false;
     model->total_lines = 0;
+    model->is_binary = false; // Initialize binary flag
+    model->long_line_detected = false; // Initialize long line flag
     model->document_path[0] = '\0';
     view_dispatcher_add_view(app->view_dispatcher, DocviewViewReader, app->view_reader);
 
@@ -590,12 +739,16 @@ static DocviewApp* Docview_app_alloc() {
         0,
         128,
         64,
-        "Document Viewer for Flipper Zero\n-Made by: C0d3-5t3w-\nUse this app to read text files.\n\n"
-        "Place TXT files in the\n'documents' folder on your SD card.\n\n"
+        "Document Viewer for Flipper Zero\n-Made by: C0d3-5t3w-\nUse this app to read document files.\n\n"
+        "Supports viewing text content from\nmultiple file types, including:\n"
+        ".txt .doc .md .js .ts .sh .go .c\n.cpp .rs .zig .html .css .scss\n"
+        ".php .json .yaml .h and more!\n\n"
+        "Place files in the\n'documents' folder on your SD card.\n\n"
+        "Or browse to any file\nusing the file browser.\n\n"
         "Controls:\n"
         "UP/DOWN: Scroll by line\n"
         "LEFT/RIGHT: Page up/down\n"
-        "OK: Toggle auto-scroll\n\n");
+        "OK: Toggle auto-scroll\n");
     view_set_previous_callback(
         widget_get_view(app->widget_about), Docview_navigation_submenu_callback);
     view_dispatcher_add_view(
