@@ -13,10 +13,12 @@ bool ble_transport_tx(const uint8_t* data, size_t size) {
     if(!furi_hal_bt_is_active()) {
         return false;
     }
-
-    if(size <= furi_hal_bt_get_max_packet_size()) {
-        memcpy(furi_hal_bt_get_tx_buffer(), data, size);
-        return true;
+    uint16_t max_packet_size = furi_hal_bt_get_max_packet_size();
+    if(size <= max_packet_size) {
+        uint8_t* tx_buffer = furi_hal_bt_get_tx_buffer();
+        memcpy(tx_buffer, data, size);
+        int32_t sent = furi_hal_bt_serial_tx(tx_buffer, (uint16_t)size);
+        return sent == (int32_t)size;
     }
     return false;
 }

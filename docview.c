@@ -16,10 +16,8 @@
 #include <string.h>
 
 // Add our custom headers
-#include "docview_icons.h"
 #include "docview_app.h"
 #include "bt_service.h"
-#include "bt_hal_compat.h"
 
 #define TAG "Docview"
 
@@ -744,14 +742,18 @@ void docview_ble_status_changed_callback(BtStatus status, void* context) {
     DocviewApp* app = context;
 
     // Handle different BT status updates based on Flipper BT service status values
-    if(status == BtStatusConnected) { // Connected
+    if(status == BtStatusConnected) {
         app->ble_state.status = BleTransferStatusConnected;
         docview_ble_transfer_update_status(app);
-    } else if(status != BtStatusOff && status != BtStatusStarted) { // Any error status
+    } else if(status != BtStatusOff && status != BtStatusAdvertising) {
         app->ble_state.status = BleTransferStatusFailed;
         docview_ble_transfer_update_status(app);
-    } else if(status == BtStatusError) { // Use BtStatusError
-        // Clean up after error
+    }
+
+    // Clean up if we're disconnected
+    // Note: Flipper uses only BtStatusConnected explicitly, other statuses must be inferred
+    if(status != BtStatusConnected && app->ble_state.status == BleTransferStatusConnected) {
+        // If we were connected but now we're not, handle disconnection
         docview_ble_transfer_stop(app);
     }
 }
@@ -871,7 +873,7 @@ void Docview_submenu_callback(void* context, uint32_t index) {
  * @brief      Allocate the Docview application.
  * @details    This function allocates the Docview application resources.
  * @return     DocviewApp object.
-*/
+ */
 static DocviewApp* Docview_app_alloc() {
     DocviewApp* app = (DocviewApp*)malloc(sizeof(DocviewApp));
     Gui* gui = furi_record_open(RECORD_GUI);
@@ -990,7 +992,7 @@ static DocviewApp* Docview_app_alloc() {
  * @brief      Free the Docview application.
  * @details    This function frees the Docview application resources.
  * @param      app  The Docview application object.
-*/
+ */
 static void Docview_app_free(DocviewApp* app) {
     // Clean up BLE transfer if active
     docview_ble_transfer_stop(app);
@@ -1037,7 +1039,7 @@ static void Docview_app_free(DocviewApp* app) {
  * @details    This function is the entry point for the Docview application.
  * @param      _p  Input parameter - unused
  * @return     0 - Success
-*/
+ */
 int32_t main_Docview_app(void* _p) {
     UNUSED(_p);
 
