@@ -16,7 +16,7 @@ App(
     fap_icon_assets="images",  # Image assets to compile for this application
     
     # Add BT dependency
-    fap_libs=["bt"],
+    fap_libs=["bt_service"],
     
     # Include all required source files
     sources=[
