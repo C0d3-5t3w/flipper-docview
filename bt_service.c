@@ -2,7 +2,6 @@
 #include "bt_hal_compat.h"
 #include "docview_app.h"
 #include <furi_hal.h>
-#include <furi_hal_bt.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -18,7 +17,7 @@ static void* status_context = NULL;
 
 // Initialize the BT service
 bool bt_service_init(void) {
-    return furi_hal_bt_is_active();
+    return bt_is_active();
 }
 
 // Deinitialize the BT service
@@ -35,7 +34,7 @@ void bt_service_subscribe_status(void* bt, BtEventCallback callback, void* conte
     status_context = context;
     // Initial connection status notification
     if(callback) {
-        if(furi_hal_bt_is_active()) {
+        if(bt_is_active()) {
             callback(BtStatusAdvertising, context);
         } else {
             callback(BtStatusOff, context);
@@ -50,9 +49,9 @@ void bt_service_unsubscribe_status(void* bt) {
     status_context = NULL;
 }
 
-// File service implementation (unchanged)
+// File service implementation
 bool ble_file_service_init(void) {
-    if(!furi_hal_bt_is_active()) {
+    if(!bt_is_active()) {
         return false;
     }
     return true;
@@ -65,10 +64,10 @@ bool ble_file_service_send(uint8_t* data, size_t size) {
         size_t chunk_size = remaining > MAX_BLE_PACKET_SIZE ? MAX_BLE_PACKET_SIZE : remaining;
         bool success = false;
         for(uint8_t attempts = 0; attempts < 3 && !success; attempts++) {
-            if(furi_hal_bt_is_active()) {
+            if(bt_is_active()) {
                 uint8_t tx_buffer[MAX_BLE_PACKET_SIZE];
                 memcpy(tx_buffer, data + offset, chunk_size);
-                int32_t sent = furi_hal_bt_serial_tx(tx_buffer, (uint16_t)chunk_size);
+                int32_t sent = bt_serial_tx(tx_buffer, (uint16_t)chunk_size);
                 if(sent == (int32_t)chunk_size) {
                     success = true;
                 }
@@ -94,8 +93,8 @@ bool ble_file_service_start_transfer(const char* file_name, uint32_t file_size) 
     size_t name_len = strlen(file_name);
     if(name_len > MAX_BLE_PACKET_SIZE - 5) name_len = MAX_BLE_PACKET_SIZE - 5;
     memcpy(&start_packet[5], file_name, name_len);
-    if(furi_hal_bt_is_active()) {
-        int32_t sent = furi_hal_bt_serial_tx(start_packet, (uint16_t)(name_len + 5));
+    if(bt_is_active()) {
+        int32_t sent = bt_serial_tx(start_packet, (uint16_t)(name_len + 5));
         return sent == (int32_t)(name_len + 5);
     }
     return false;
@@ -103,8 +102,8 @@ bool ble_file_service_start_transfer(const char* file_name, uint32_t file_size) 
 
 bool ble_file_service_end_transfer(void) {
     uint8_t end_packet[1] = {FILE_CONTROL_END};
-    if(furi_hal_bt_is_active()) {
-        int32_t sent = furi_hal_bt_serial_tx(end_packet, 1);
+    if(bt_is_active()) {
+        int32_t sent = bt_serial_tx(end_packet, 1);
         return sent == 1;
     }
     return false;

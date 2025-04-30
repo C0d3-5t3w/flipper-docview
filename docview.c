@@ -1033,7 +1033,7 @@ static void Docview_app_free(DocviewApp* app) {
  */
 int32_t main_Docview_app(void* _p) {
     UNUSED(_p);
-    furi_hal_bt_init(); // Initialize the hardware layer (keep this)
+    int bt_init(); // Use our compatibility wrapper instead of direct call
 
     DocviewApp* app = Docview_app_alloc();
     view_dispatcher_run(app->view_dispatcher);

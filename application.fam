@@ -10,13 +10,12 @@ App(
     # Optional values
     fap_version="0.1",
     fap_icon="docview.png",  # 10x10 1-bit PNG
-    fap_description="View text content and share via BLE from multiple file types including txt, md, c, cpp and more",
+    fap_description="View text content and share via BLE from multiple file types (BLE sharing requires compatible firmware)",
     fap_author="C0d3-5t3w",
     fap_weburl="https://github.com/C0d3-5t3w/flipper-docview",
     fap_icon_assets="images",  # Image assets to compile for this application
     
-    # Remove the bt_service library dependency since we're implementing our own
-    # fap_libs=["bt_service"],
+    # We implement our own BT compatibility layer
     
     # Include all required source files
     sources=[
