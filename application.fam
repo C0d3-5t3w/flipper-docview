@@ -11,7 +11,7 @@ App(
     fap_version="0.1",
     fap_icon="docview.png",  # 10x10 1-bit PNG
     fap_description="View text content and share via BLE from multiple file types including txt, md, c, cpp and more",
-    fap_author="Flipper User",
+    fap_author="C0d3-5t3w",
     fap_weburl="https://github.com/C0d3-5t3w/flipper-docview",
     fap_icon_assets="images",  # Image assets to compile for this application
     
