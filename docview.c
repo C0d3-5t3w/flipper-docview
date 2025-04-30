@@ -739,8 +739,8 @@ static DocviewApp* Docview_app_alloc() {
         0,
         128,
         64,
-        "Document Viewer for Flipper Zero\n-Made by: C0d3-5t3w-\nUse this app to read document files.\n\n"
-        "Supports viewing text content from\nmultiple file types, including:\n"
+        "Document Viewer for \nFlipper Zero\n-Made by: C0d3-5t3w-\nUse this app to \nread document files.\n\n"
+        "Supports viewing \ntext content from\nmultiple file types, including:\n"
         ".txt .doc .md .js .ts .sh .go .c\n.cpp .rs .zig .html .css .scss\n"
         ".php .json .yaml .h and more!\n\n"
         "Place files in the\n'documents' folder on your SD card.\n\n"
