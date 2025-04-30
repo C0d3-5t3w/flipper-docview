@@ -206,8 +206,8 @@ static bool Docview_load_document(DocviewReaderModel* model) {
 
 // Font size options
 static const char* font_size_config_label = "Font Size";
-static char* font_size_names[] = {"Very Very Small", "Very Small", "Small", "Medium", "Large"};
-static const uint8_t font_sizes[] = {0, 1, 2, 3, 4}; // Integer indices for font sizes
+static char* font_size_names[] = {"Tiny", "Large"};
+static const uint8_t font_sizes[] = {2, 3}; // Using indices for Small/Medium from original code
 
 static void Docview_font_size_change(VariableItem* item) {
     DocviewApp* app = variable_item_get_context(item);
@@ -254,23 +254,11 @@ static void Docview_view_reader_draw_callback(Canvas* canvas, void* model) {
 
     // Select font and set appropriate line height based on font size
     switch(my_model->font_size) {
-    case 0: // Very Very Small
-        canvas_set_font(canvas, FontSecondary);
-        font_height = 5; // Extremely compact line height
-        break;
-    case 1: // Very Small
-        canvas_set_font(canvas, FontSecondary);
-        font_height = 6; // Very compact line height
-        break;
-    case 2: // Small
+    case 2: // Tiny (formerly "Small")
         canvas_set_font(canvas, FontSecondary);
         font_height = 8;
         break;
-    case 4: // Large
-        canvas_set_font(canvas, FontBigNumbers);
-        font_height = 16;
-        break;
-    case 3: // Medium
+    case 3: // Large (formerly "Medium")
     default:
         canvas_set_font(canvas, FontPrimary);
         font_height = 12;
@@ -310,15 +298,10 @@ static void Docview_view_reader_draw_callback(Canvas* canvas, void* model) {
 
     // Set font for content display based on selected font size
     switch(my_model->font_size) {
-    case 0:
-    case 1:
-    case 2:
+    case 2: // Tiny
         canvas_set_font(canvas, FontSecondary);
         break;
-    case 4:
-        canvas_set_font(canvas, FontBigNumbers);
-        break;
-    case 3:
+    case 3: // Large
     default:
         canvas_set_font(canvas, FontPrimary);
         break;
@@ -518,17 +501,11 @@ static bool Docview_view_reader_input_callback(InputEvent* event, void* context)
                 {
                     model->h_scroll_offset = 0; // Reset horizontal scroll when manually navigating
                     uint8_t lines_to_show;
-                    // Use the font_size as direct index now (0-4)
-                    if(model->font_size == 0)
-                        lines_to_show = 12; // Very Very Small
-                    else if(model->font_size == 1)
-                        lines_to_show = 10; // Very Small
-                    else if(model->font_size == 2)
-                        lines_to_show = 8; // Small
-                    else if(model->font_size == 4)
-                        lines_to_show = 3; // Large
+                    // Simplified font size logic
+                    if(model->font_size == 2)
+                        lines_to_show = 8; // Tiny
                     else
-                        lines_to_show = 5; // Medium
+                        lines_to_show = 5; // Large
 
                     if(model->scroll_position >= lines_to_show) {
                         model->scroll_position -= lines_to_show;
@@ -546,17 +523,11 @@ static bool Docview_view_reader_input_callback(InputEvent* event, void* context)
                 {
                     model->h_scroll_offset = 0; // Reset horizontal scroll when manually navigating
                     uint8_t lines_to_show;
-                    // Use the font_size as direct index now (0-4)
-                    if(model->font_size == 0)
-                        lines_to_show = 12; // Very Very Small
-                    else if(model->font_size == 1)
-                        lines_to_show = 10; // Very Small
-                    else if(model->font_size == 2)
-                        lines_to_show = 8; // Small
-                    else if(model->font_size == 4)
-                        lines_to_show = 3; // Large
+                    // Simplified font size logic
+                    if(model->font_size == 2)
+                        lines_to_show = 8; // Tiny
                     else
-                        lines_to_show = 5; // Medium
+                        lines_to_show = 5; // Large
 
                     model->scroll_position += lines_to_show;
                     if(model->scroll_position >= model->total_lines) {
@@ -688,7 +659,7 @@ static DocviewApp* Docview_app_alloc() {
         COUNT_OF(font_sizes),
         Docview_font_size_change,
         app);
-    uint8_t font_size_index = 3; // Default to medium (index 3 now)
+    uint8_t font_size_index = 1; // Default to Large (index 1)
     variable_item_set_current_value_index(item, font_size_index);
     variable_item_set_current_value_text(item, font_size_names[font_size_index]);
 
@@ -721,7 +692,7 @@ static DocviewApp* Docview_app_alloc() {
     view_set_context(app->view_reader, app);
     view_allocate_model(app->view_reader, ViewModelTypeLockFree, sizeof(DocviewReaderModel));
     DocviewReaderModel* model = view_get_model(app->view_reader);
-    model->font_size = font_sizes[font_size_index];
+    model->font_size = font_sizes[font_size_index]; // Default to Large
     model->scroll_position = 0;
     model->h_scroll_offset = 0; // Initialize horizontal scroll offset
     model->auto_scroll = (auto_scroll_index == 1);
