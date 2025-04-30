@@ -60,6 +60,10 @@ typedef enum {
     BleTransferStatusFailed,
 } BleTransferStatus;
 
+// Add thread flags 
+#define BLE_THREAD_FLAG_STOP (1 << 0)
+#define BLE_THREAD_FLAG_ALL (BLE_THREAD_FLAG_STOP)
+
 typedef struct {
     BleTransferStatus status;
     uint16_t total_chunks;
@@ -70,7 +74,7 @@ typedef struct {
     FuriString* file_path;
     FuriTimer* timeout_timer;
     FuriThread* thread;
-    FuriMutex* mutex;  // Add mutex for BLE state protection
+    FuriMutex* mutex;  // Add mutex for BLE state protection 
     bool transfer_active;
 } BleTransferState;
 

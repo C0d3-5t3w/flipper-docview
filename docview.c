@@ -460,7 +460,9 @@ static bool Docview_view_reader_input_callback(InputEvent* event, void* context)
 void docview_ble_transfer_stop(DocviewApp* app) {
     furi_assert(app);
 
+    // Signal thread to stop
     if(app->ble_state.thread) {
+        furi_thread_flags_set(furi_thread_get_id(app->ble_state.thread), BLE_THREAD_FLAG_STOP);
         furi_thread_join(app->ble_state.thread);
         furi_thread_free(app->ble_state.thread);
         app->ble_state.thread = NULL;
@@ -472,16 +474,30 @@ void docview_ble_transfer_stop(DocviewApp* app) {
         app->ble_state.timeout_timer = NULL;
     }
 
+    if(app->ble_state.mutex) {
+        furi_mutex_free(app->ble_state.mutex);
+        app->ble_state.mutex = NULL;
+    }
+
+    app->ble_state.transfer_active = false;
     ble_file_service_deinit();
 }
 
 void docview_ble_transfer_start(DocviewApp* app) {
     furi_assert(app);
 
+    // Initialize mutex first
+    app->ble_state.mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    if(!app->ble_state.mutex) {
+        app->ble_state.status = BleTransferStatusFailed;
+        return;
+    }
+
     // Initialize BLE state
     app->ble_state.status = BleTransferStatusIdle;
     app->ble_state.chunks_sent = 0;
     app->ble_state.bytes_sent = 0;
+    app->ble_state.transfer_active = true;
 
     // Get file info
     Storage* storage = furi_record_open(RECORD_STORAGE);
@@ -512,11 +528,19 @@ void docview_ble_transfer_start(DocviewApp* app) {
     // Start timeout timer
     app->ble_state.timeout_timer =
         furi_timer_alloc(docview_ble_timeout_callback, FuriTimerTypeOnce, app);
+    if(!app->ble_state.timeout_timer) {
+        docview_ble_transfer_stop(app);
+        return;
+    }
     furi_timer_start(app->ble_state.timeout_timer, BLE_TRANSFER_TIMEOUT);
 
     // Start transfer thread
     app->ble_state.thread =
         furi_thread_alloc_ex("BleTransfer", 2048, docview_ble_transfer_process_callback, app);
+    if(!app->ble_state.thread) {
+        docview_ble_transfer_stop(app);
+        return;
+    }
     furi_thread_start(app->ble_state.thread);
 }
 
