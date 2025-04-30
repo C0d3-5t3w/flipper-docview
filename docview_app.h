@@ -10,6 +10,7 @@
 #include <gui/modules/widget.h>
 #include <gui/modules/variable_item_list.h>
 #include <gui/modules/popup.h>
+#include <gui/modules/file_browser.h>
 #include <notification/notification.h>
 #include <notification/notification_messages.h>
 #include <storage/storage.h>
@@ -25,13 +26,12 @@ typedef enum {
 
 typedef void* Bt;
 
-
 typedef enum {
     DocviewSubmenuIndexOpenFile,
+    DocviewSubmenuIndexBleAirdrop,
     DocviewSubmenuIndexSettings,
     DocviewSubmenuIndexAbout,
 } DocviewSubmenuIndex;
-
 
 typedef enum {
     DocviewViewSubmenu,    
@@ -51,7 +51,6 @@ typedef enum {
     DocviewEventIdBleFailed = 4,
 } DocviewEventId;
 
-
 typedef enum {
     BleTransferStatusIdle,
     BleTransferStatusAdvertising,
@@ -60,7 +59,6 @@ typedef enum {
     BleTransferStatusComplete,
     BleTransferStatusFailed,
 } BleTransferStatus;
-
 
 typedef struct {
     BleTransferStatus status;
@@ -88,7 +86,8 @@ typedef struct {
     char* temp_buffer;               
     uint32_t temp_buffer_size;       
     BleTransferState ble_state;      
-    FuriTimer* timer;                
+    FuriTimer* timer;
+    FileBrowser* file_browser;
 } DocviewApp;
 
 typedef struct {
@@ -105,7 +104,7 @@ typedef struct {
     bool long_line_detected;       
 } DocviewReaderModel;
 
-
+// Function declarations
 void docview_ble_transfer_start(DocviewApp* app);
 void docview_ble_transfer_stop(DocviewApp* app);
 void docview_ble_transfer_update_status(DocviewApp* app);

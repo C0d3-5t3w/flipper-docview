@@ -11,28 +11,23 @@
 
 #define MAX_BLE_PACKET_SIZE 20
 
-// Globals for BT service callbacks
 static BtEventCallback status_callback = NULL;
 static void* status_context = NULL;
 
-// Initialize the BT service
 bool bt_service_init(void) {
     return bt_is_active();
 }
 
-// Deinitialize the BT service
 void bt_service_deinit(void) {
-    // Clean up callback
     status_callback = NULL;
     status_context = NULL;
 }
 
-// Subscribe to BT status changes
 void bt_service_subscribe_status(void* bt, BtEventCallback callback, void* context) {
     UNUSED(bt);
     status_callback = callback;
     status_context = context;
-    // Initial connection status notification
+
     if(callback) {
         if(bt_is_active()) {
             callback(BtStatusAdvertising, context);
@@ -42,14 +37,12 @@ void bt_service_subscribe_status(void* bt, BtEventCallback callback, void* conte
     }
 }
 
-// Unsubscribe from BT status changes
 void bt_service_unsubscribe_status(void* bt) {
     UNUSED(bt);
     status_callback = NULL;
     status_context = NULL;
 }
 
-// File service implementation
 bool ble_file_service_init(void) {
     if(!bt_is_active()) {
         return false;
@@ -110,5 +103,4 @@ bool ble_file_service_end_transfer(void) {
 }
 
 void ble_file_service_deinit(void) {
-    // Nothing to do here, keeping function for API consistency
 }

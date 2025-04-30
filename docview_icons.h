@@ -4,12 +4,10 @@
 
 extern const Icon I_doc;
 
-// BLE transfer icons
 extern const Icon I_BleWaitConnecting_15x15;
 extern const Icon I_BleConnected_15x15;
 extern const Icon I_Loading_10x10;
 
-// Use standard system icons
 #include <gui/icon_i.h>
 extern const Icon I_Ok_15x15;
 extern const Icon I_Error_15x15;
