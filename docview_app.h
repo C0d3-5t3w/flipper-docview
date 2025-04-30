@@ -69,6 +69,9 @@ typedef struct {
     char file_name[64];
     FuriString* file_path;
     FuriTimer* timeout_timer;
+    FuriThread* thread;
+    FuriMutex* mutex;
+    bool transfer_active;
 } BleTransferState;
 
 typedef struct {

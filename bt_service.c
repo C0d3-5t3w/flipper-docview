@@ -19,6 +19,10 @@ bool bt_service_init(void) {
 }
 
 void bt_service_deinit(void) {
+    // Stop any ongoing transfers
+    ble_file_service_deinit();
+
+    // Clear callbacks
     status_callback = NULL;
     status_context = NULL;
 }
@@ -103,4 +107,9 @@ bool ble_file_service_end_transfer(void) {
 }
 
 void ble_file_service_deinit(void) {
+    // Send error packet if transfer was active
+    uint8_t error_packet[1] = {FILE_CONTROL_ERROR};
+    if(bt_is_active()) {
+        bt_serial_tx(error_packet, 1);
+    }
 }
