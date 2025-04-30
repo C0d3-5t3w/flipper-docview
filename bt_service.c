@@ -13,71 +13,115 @@
 
 static BtEventCallback status_callback = NULL;
 static void* status_context = NULL;
+static FuriMutex* bt_mutex = NULL;
 
 bool bt_service_init(void) {
-    return bt_is_active();
+    if(!bt_mutex) {
+        bt_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+        if(!bt_mutex) return false;
+    }
+
+    bool success = false;
+    if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
+        bt_init(); // Initialize BT stack
+        success = bt_is_active();
+        if(success) {
+            status_callback = NULL;
+            status_context = NULL;
+        }
+        furi_mutex_release(bt_mutex);
+    }
+    return success;
 }
 
 void bt_service_deinit(void) {
-    // Stop any ongoing transfers
-    ble_file_service_deinit();
+    if(!bt_mutex) return;
 
-    // Clear callbacks
-    status_callback = NULL;
-    status_context = NULL;
+    if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
+        ble_file_service_deinit();
+
+        if(status_callback) {
+            status_callback(BtStatusOff, status_context);
+        }
+        status_callback = NULL;
+        status_context = NULL;
+
+        furi_mutex_release(bt_mutex);
+    }
+
+    furi_mutex_free(bt_mutex);
+    bt_mutex = NULL;
 }
 
 void bt_service_subscribe_status(void* bt, BtEventCallback callback, void* context) {
     UNUSED(bt);
-    status_callback = callback;
-    status_context = context;
+    if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
+        status_callback = callback;
+        status_context = context;
 
-    if(callback) {
-        if(bt_is_active()) {
-            callback(BtStatusAdvertising, context);
-        } else {
-            callback(BtStatusOff, context);
+        if(callback) {
+            if(bt_is_active()) {
+                callback(BtStatusAdvertising, context);
+            } else {
+                callback(BtStatusOff, context);
+            }
         }
+        furi_mutex_release(bt_mutex);
     }
 }
 
 void bt_service_unsubscribe_status(void* bt) {
     UNUSED(bt);
-    status_callback = NULL;
-    status_context = NULL;
+    if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
+        status_callback = NULL;
+        status_context = NULL;
+        furi_mutex_release(bt_mutex);
+    }
 }
 
 bool ble_file_service_init(void) {
-    if(!bt_is_active()) {
-        return false;
+    bool success = false;
+    if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
+        if(bt_is_active()) {
+            success = true;
+        }
+        furi_mutex_release(bt_mutex);
     }
-    return true;
+    return success;
 }
 
 bool ble_file_service_send(uint8_t* data, size_t size) {
-    size_t remaining = size;
-    size_t offset = 0;
-    while(remaining > 0) {
-        size_t chunk_size = remaining > MAX_BLE_PACKET_SIZE ? MAX_BLE_PACKET_SIZE : remaining;
-        bool success = false;
-        for(uint8_t attempts = 0; attempts < 3 && !success; attempts++) {
-            if(bt_is_active()) {
-                uint8_t tx_buffer[MAX_BLE_PACKET_SIZE];
-                memcpy(tx_buffer, data + offset, chunk_size);
-                int32_t sent = bt_serial_tx(tx_buffer, (uint16_t)chunk_size);
-                if(sent == (int32_t)chunk_size) {
-                    success = true;
+    bool success = false;
+    if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
+        size_t remaining = size;
+        size_t offset = 0;
+        while(remaining > 0) {
+            size_t chunk_size = remaining > MAX_BLE_PACKET_SIZE ? MAX_BLE_PACKET_SIZE : remaining;
+            bool sent_success = false;
+            for(uint8_t attempts = 0; attempts < 3 && !sent_success; attempts++) {
+                if(bt_is_active()) {
+                    uint8_t tx_buffer[MAX_BLE_PACKET_SIZE];
+                    memcpy(tx_buffer, data + offset, chunk_size);
+                    int32_t sent = bt_serial_tx(tx_buffer, (uint16_t)chunk_size);
+                    if(sent == (int32_t)chunk_size) {
+                        sent_success = true;
+                    }
+                } else {
+                    furi_delay_ms(10);
                 }
-            } else {
-                furi_delay_ms(10);
             }
+            if(!sent_success) {
+                success = false;
+                break;
+            }
+            offset += chunk_size;
+            remaining -= chunk_size;
+            furi_delay_ms(5);
         }
-        if(!success) return false;
-        offset += chunk_size;
-        remaining -= chunk_size;
-        furi_delay_ms(5);
+        success = true;
+        furi_mutex_release(bt_mutex);
     }
-    return true;
+    return success;
 }
 
 bool ble_file_service_start_transfer(const char* file_name, uint32_t file_size) {
@@ -107,9 +151,9 @@ bool ble_file_service_end_transfer(void) {
 }
 
 void ble_file_service_deinit(void) {
-    // Send error packet if transfer was active
-    uint8_t error_packet[1] = {FILE_CONTROL_ERROR};
     if(bt_is_active()) {
+        // Send error packet if transfer was active
+        uint8_t error_packet[1] = {FILE_CONTROL_ERROR};
         bt_serial_tx(error_packet, 1);
     }
 }

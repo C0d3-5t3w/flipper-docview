@@ -457,13 +457,36 @@ static bool Docview_view_reader_input_callback(InputEvent* event, void* context)
     return false;
 }
 
+void docview_ble_transfer_stop(DocviewApp* app) {
+    furi_assert(app);
+
+    if(app->ble_state.thread) {
+        furi_thread_join(app->ble_state.thread);
+        furi_thread_free(app->ble_state.thread);
+        app->ble_state.thread = NULL;
+    }
+
+    if(app->ble_state.timeout_timer) {
+        furi_timer_stop(app->ble_state.timeout_timer);
+        furi_timer_free(app->ble_state.timeout_timer);
+        app->ble_state.timeout_timer = NULL;
+    }
+
+    ble_file_service_deinit();
+}
+
 void docview_ble_transfer_start(DocviewApp* app) {
-    app->ble_state.status = BleTransferStatusAdvertising;
+    furi_assert(app);
+
+    // Initialize BLE state
+    app->ble_state.status = BleTransferStatusIdle;
     app->ble_state.chunks_sent = 0;
     app->ble_state.bytes_sent = 0;
 
+    // Get file info
     Storage* storage = furi_record_open(RECORD_STORAGE);
     FileInfo file_info;
+
     if(storage_common_stat(storage, furi_string_get_cstr(app->ble_state.file_path), &file_info) ==
        FSE_OK) {
         app->ble_state.file_size = file_info.size;
@@ -476,31 +499,25 @@ void docview_ble_transfer_start(DocviewApp* app) {
 
     furi_record_close(RECORD_STORAGE);
 
+    // Initialize BLE service
     if(!ble_file_service_init()) {
         app->ble_state.status = BleTransferStatusFailed;
         docview_ble_transfer_update_status(app);
         return;
     }
 
+    app->ble_state.status = BleTransferStatusAdvertising;
     docview_ble_transfer_update_status(app);
 
+    // Start timeout timer
     app->ble_state.timeout_timer =
         furi_timer_alloc(docview_ble_timeout_callback, FuriTimerTypeOnce, app);
     furi_timer_start(app->ble_state.timeout_timer, BLE_TRANSFER_TIMEOUT);
 
-    FuriThread* thread =
-        furi_thread_alloc_ex("BleTransfer", 1024, docview_ble_transfer_process_callback, app);
-    furi_thread_start(thread);
-}
-
-void docview_ble_transfer_stop(DocviewApp* app) {
-    ble_file_service_deinit();
-
-    if(app->ble_state.timeout_timer) {
-        furi_timer_stop(app->ble_state.timeout_timer);
-        furi_timer_free(app->ble_state.timeout_timer);
-        app->ble_state.timeout_timer = NULL;
-    }
+    // Start transfer thread
+    app->ble_state.thread =
+        furi_thread_alloc_ex("BleTransfer", 2048, docview_ble_transfer_process_callback, app);
+    furi_thread_start(app->ble_state.thread);
 }
 
 void docview_ble_transfer_update_status(DocviewApp* app) {
@@ -852,6 +869,7 @@ static DocviewApp* Docview_app_alloc() {
     app->ble_state.status = BleTransferStatusIdle;
     app->ble_state.file_path = NULL;
     app->ble_state.timeout_timer = NULL;
+    app->ble_state.thread = NULL;
 
     app->popup_ble = popup_alloc();
     view_set_context(popup_get_view(app->popup_ble), app);
@@ -876,8 +894,10 @@ static DocviewApp* Docview_app_alloc() {
 }
 
 static void Docview_app_free(DocviewApp* app) {
-    bt_service_unsubscribe_status(app->bt);
+    furi_assert(app);
 
+    // Cleanup BLE resources first
+    bt_service_unsubscribe_status(app->bt);
     docview_ble_transfer_stop(app);
 
     if(app->ble_state.file_path) {
