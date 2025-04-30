@@ -201,7 +201,8 @@ static bool Docview_load_document(DocviewReaderModel* model) {
 // Font size options
 static const char* font_size_config_label = "Font Size";
 static char* font_size_names[] = {"Very Very Small", "Very Small", "Small", "Medium", "Large"};
-static const uint8_t font_sizes[] = {0, 1, 2, 3, 4}; // Corresponds to font height multipliers
+static const float font_sizes[] =
+    {0.1, 0.5, 1.5, 2.0, 2.5}; // Corresponds to font height multipliers
 
 static void Docview_font_size_change(VariableItem* item) {
     DocviewApp* app = variable_item_get_context(item);
@@ -332,7 +333,7 @@ static void Docview_view_reader_draw_callback(Canvas* canvas, void* model) {
 
     // Show navigation hints at the bottom
     canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str_aligned(canvas, 64, 64, AlignCenter, AlignBottom, "UP/DOWN to scroll");
+    canvas_draw_str_aligned(canvas, 64, 64, AlignCenter, AlignBottom, "<3");
 }
 
 /**
@@ -594,8 +595,7 @@ static DocviewApp* Docview_app_alloc() {
         "Controls:\n"
         "UP/DOWN: Scroll by line\n"
         "LEFT/RIGHT: Page up/down\n"
-        "OK: Toggle auto-scroll\n\n"
-        "Based on template by @codeallnight");
+        "OK: Toggle auto-scroll\n\n");
     view_set_previous_callback(
         widget_get_view(app->widget_about), Docview_navigation_submenu_callback);
     view_dispatcher_add_view(
