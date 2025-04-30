@@ -802,11 +802,26 @@ void Docview_submenu_callback(void* context, uint32_t index) {
 }
 
 static DocviewApp* Docview_app_alloc() {
-    DocviewApp* app = (DocviewApp*)malloc(sizeof(DocviewApp));
-    Gui* gui = furi_record_open(RECORD_GUI);
+    DocviewApp* app = malloc(sizeof(DocviewApp));
 
+    // Initialize BT first
+    if(!bt_service_init()) {
+        free(app);
+        return NULL;
+    }
+
+    app->bt = NULL;
+    app->ble_state.mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    if(!app->ble_state.mutex) {
+        bt_service_deinit();
+        free(app);
+        return NULL;
+    }
+
+    // Initialize view system
+    app->gui = furi_record_open(RECORD_GUI);
     app->view_dispatcher = view_dispatcher_alloc();
-    view_dispatcher_attach_to_gui(app->view_dispatcher, gui, ViewDispatcherTypeFullscreen);
+    view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
     view_dispatcher_set_event_callback_context(app->view_dispatcher, app);
 
     Storage* storage = furi_record_open(RECORD_STORAGE);
@@ -920,9 +935,18 @@ static DocviewApp* Docview_app_alloc() {
 static void Docview_app_free(DocviewApp* app) {
     furi_assert(app);
 
-    // Cleanup BLE resources first
+    // Stop any active BLE transfers first
+    if(app->ble_state.transfer_active) {
+        docview_ble_transfer_stop(app);
+    }
+
+    // Cleanup BT service
     bt_service_unsubscribe_status(app->bt);
-    docview_ble_transfer_stop(app);
+    bt_service_deinit();
+
+    if(app->ble_state.mutex) {
+        furi_mutex_free(app->ble_state.mutex);
+    }
 
     if(app->ble_state.file_path) {
         furi_string_free(app->ble_state.file_path);
@@ -964,8 +988,18 @@ int32_t main_Docview_app(void* _p) {
     UNUSED(_p);
     bt_init();
 
+    // Allocate app with safety check
     DocviewApp* app = Docview_app_alloc();
+    if(!app) {
+        FURI_LOG_E(TAG, "Failed to allocate application");
+        return 255;
+    }
+
+    // Run app
     view_dispatcher_run(app->view_dispatcher);
+
+    // Cleanup
     Docview_app_free(app);
+
     return 0;
 }

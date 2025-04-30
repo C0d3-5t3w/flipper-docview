@@ -79,7 +79,8 @@ typedef struct {
 } BleTransferState;
 
 typedef struct {
-    ViewDispatcher* view_dispatcher; 
+    ViewDispatcher* view_dispatcher;
+    Gui* gui;  // Add GUI pointer
     NotificationApp* notifications;  
     Submenu* submenu;                
     TextInput* text_input;           

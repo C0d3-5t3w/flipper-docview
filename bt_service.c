@@ -43,19 +43,19 @@ bool bt_service_init(void) {
 void bt_service_deinit(void) {
     furi_assert(bt_mutex);
 
-    if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
-        // Stop any active transfers first
-        ble_file_service_deinit();
+    // Ensure no active transfers
+    ble_file_service_deinit();
 
+    if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
         if(status_callback) {
             status_callback(BtStatusOff, status_context);
             status_callback = NULL;
             status_context = NULL;
         }
-
         furi_mutex_release(bt_mutex);
     }
 
+    // Free mutex last
     furi_mutex_free(bt_mutex);
     bt_mutex = NULL;
 }
