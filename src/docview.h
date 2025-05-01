@@ -60,7 +60,7 @@ typedef enum {
     BleTransferStatusFailed,
 } BleTransferStatus;
 
-// Add thread flags 
+// Thread flags for signaling between threads
 #define BLE_THREAD_FLAG_STOP (1 << 0)
 #define BLE_THREAD_FLAG_ALL (BLE_THREAD_FLAG_STOP)
 
@@ -128,16 +128,9 @@ void docview_ble_transfer_stop(DocviewApp* app);
 void docview_ble_transfer_update_status(DocviewApp* app);
 void docview_ble_timeout_callback(void* context);
 
-// File browsing helper declarations
+// File browsing helper declarations - only declare our custom functions
 bool docview_file_browser_callback(const char* path, void* context);
 void docview_file_browser_void_callback(void* context);
-
-// Forward declaration of FileBrowser callback type to avoid conflicts
-typedef void (*FileBrowserCallback)(void* context);
-
-// DO NOT define the FileBrowser API functions here
-// Let the compiler use the ones from the Flipper OS headers
-// This prevents conflicting types errors
 
 // Process callback - non-static declaration
 int32_t docview_ble_transfer_process_callback(void* context); 

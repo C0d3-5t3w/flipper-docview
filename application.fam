@@ -17,10 +17,14 @@ App(
     
     # Include all required source files
     sources=[
-        "docview.c", 
-        "ble/bt_service.c",
-        "ble/ble_transport.c",
-        "icons/ble_icons.c",
-        "files/file_browser_utils.c",
-    ]
+        "src/docview.c", 
+        "src/ble/bt_service.c",
+        "src/ble/ble_transport.c",
+        "src/icons/ble_icons.c",
+        "src/files/file_browser_utils.c",
+        "src/files/file_browser.c",
+    ],
+    
+    # Link against required SDK modules - the firmware will provide these libraries
+    fap_libs=["file_browser", "storage"],
 )

@@ -9,6 +9,7 @@
 #include <gui/modules/widget.h>
 #include <gui/modules/variable_item_list.h>
 #include <gui/modules/popup.h>
+#include <gui/modules/file_browser.h>
 #include <notification/notification.h>
 #include <notification/notification_messages.h>
 #include <storage/storage.h>
@@ -18,6 +19,7 @@
 
 #include "docview.h"
 #include "ble/bt_service.h"
+#include "files/file_browser.h"
 #include "icons/docview_icons.h"
 
 #define TAG "Docview"
@@ -441,15 +443,33 @@ int32_t docview_ble_transfer_process_callback(void* context) {
     bool success = false;
 
     do {
+        if(!furi_string_get_cstr(app->ble_state.file_path)) {
+            FURI_LOG_E(TAG, "Invalid file path");
+            break;
+        }
+
         if(!storage_file_open(
                file,
                furi_string_get_cstr(app->ble_state.file_path),
                FSAM_READ,
                FSOM_OPEN_EXISTING)) {
+            FURI_LOG_E(TAG, "Failed to open file");
             break;
         }
 
+        // Get file size before transfer
+        FileInfo file_info;
+        if(storage_common_stat(
+               storage, furi_string_get_cstr(app->ble_state.file_path), &file_info) != FSE_OK) {
+            FURI_LOG_E(TAG, "Failed to get file size");
+            break;
+        }
+
+        app->ble_state.file_size = file_info.size;
+        FURI_LOG_I(TAG, "Starting file transfer, size: %lu bytes", app->ble_state.file_size);
+
         if(!ble_file_service_start_transfer(app->ble_state.file_name, app->ble_state.file_size)) {
+            FURI_LOG_E(TAG, "Failed to start BLE transfer");
             break;
         }
 
@@ -457,14 +477,21 @@ int32_t docview_ble_transfer_process_callback(void* context) {
         docview_ble_transfer_update_status(app);
 
         while(app->ble_state.bytes_sent < app->ble_state.file_size) {
-            // Check stop flag
+            // Check stop flag - non-blocking check for thread flag
             uint32_t flags = furi_thread_flags_get();
-            if(flags & BLE_THREAD_FLAG_STOP) break;
+            if(flags & BLE_THREAD_FLAG_STOP) {
+                FURI_LOG_I(TAG, "Transfer stopped by request");
+                break;
+            }
 
             size_t bytes_read = storage_file_read(file, buffer, BLE_CHUNK_SIZE);
-            if(bytes_read == 0) break;
+            if(bytes_read == 0) {
+                FURI_LOG_W(TAG, "End of file reached");
+                break;
+            }
 
             if(!ble_file_service_send(buffer, bytes_read)) {
+                FURI_LOG_E(TAG, "Failed to send data chunk");
                 break;
             }
 
@@ -475,6 +502,7 @@ int32_t docview_ble_transfer_process_callback(void* context) {
 
         if(app->ble_state.bytes_sent == app->ble_state.file_size) {
             success = ble_file_service_end_transfer();
+            FURI_LOG_I(TAG, "File transfer complete: %s", success ? "SUCCESS" : "FAILED");
         }
 
     } while(0);
@@ -683,19 +711,14 @@ void docview_file_browser_void_callback(void* context) {
     DocviewApp* app = context;
     if(!app || !app->file_browser) return;
 
-    // Create a temporary FuriString to store the path
     FuriString* path = furi_string_alloc();
 
-    // Get the path from the file browser and store it in path
-    file_browser_get_path(app->file_browser, path);
+    docview_get_file_path(app->file_browser, path);
 
-    // Only proceed if the path is not empty
     if(!furi_string_empty(path)) {
-        // Call the regular callback with the path string
         docview_file_browser_callback(furi_string_get_cstr(path), app);
     }
 
-    // Free the temporary string
     furi_string_free(path);
 }
 
@@ -725,24 +748,31 @@ static void docview_submenu_callback(void* context, uint32_t index) {
     switch(index) {
     case DocviewSubmenuIndexOpenFile:
         if(!app->file_browser) {
-            // Initialize the file path string if needed
+            // Initialize file path if needed
             if(!app->ble_state.file_path) {
                 app->ble_state.file_path = furi_string_alloc();
             }
 
-            // Start with the documents folder path
             FuriString* path = furi_string_alloc_set(DOCUMENTS_FOLDER_PATH);
             app->file_browser = file_browser_alloc(path);
             furi_string_free(path);
         }
 
+        // Configure file browser with proper parameters
         file_browser_configure(
-            app->file_browser, DOCUMENT_EXT_FILTER, NULL, true, false, NULL, NULL);
+            app->file_browser,
+            DOCUMENT_EXT_FILTER,
+            NULL, // Skip assets folder (pass NULL to use default)
+            true, // Hide dot files
+            false, // Don't hide file extensions
+            NULL, // Optional icon (NULL = no icon)
+            false // Don't hide parent directory
+        );
 
-        // Set the callback to handle file selection
+        // Set callback for file selection
         file_browser_set_callback(app->file_browser, docview_file_browser_void_callback, app);
 
-        // Start the file browser with the current path or default
+        // Start browser
         file_browser_start(app->file_browser, app->ble_state.file_path);
         break;
 
@@ -750,6 +780,22 @@ static void docview_submenu_callback(void* context, uint32_t index) {
         if(app->ble_state.file_path && !furi_string_empty(app->ble_state.file_path)) {
             view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewBleTransfer);
             docview_ble_transfer_start(app);
+        } else {
+            // No file selected, show open dialog first
+            if(!app->file_browser) {
+                FuriString* path = furi_string_alloc_set(DOCUMENTS_FOLDER_PATH);
+                app->file_browser = file_browser_alloc(path);
+                furi_string_free(path);
+
+                file_browser_configure(
+                    app->file_browser, DOCUMENT_EXT_FILTER, NULL, true, false, NULL, false);
+
+                // Set a special callback that will auto-start airdrop after selection
+                file_browser_set_callback(
+                    app->file_browser, docview_file_browser_void_callback, app);
+            }
+
+            file_browser_start(app->file_browser, app->ble_state.file_path);
         }
         break;
 
@@ -959,11 +1005,8 @@ int32_t main_Docview_app(void* p) {
 
         bt_service_subscribe_status(docview_ble_status_changed_callback, app);
 
-        if(!view_dispatcher_attach_to_gui(
-               app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen)) {
-            FURI_LOG_E(TAG, "Failed to attach view dispatcher");
-            break;
-        }
+        view_dispatcher_attach_to_gui(
+            app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
 
         view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewSubmenu);
         view_dispatcher_run(app->view_dispatcher);

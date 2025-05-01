@@ -1,6 +1,6 @@
 #include "bt_service.h"
 #include "bt_hal_compat.h"
-#include "docview.h"
+#include "../docview.h"
 #include <furi_hal.h>
 #include <stdint.h>
 #include <string.h>
