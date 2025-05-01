@@ -16,9 +16,9 @@
 #include <toolbox/path.h>
 #include <string.h>
 
-#include "docview_app.h"
-#include "bt_service.h"
-#include "docview_icons.h"
+#include "docview.h"
+#include "ble/bt_service.h"
+#include "icons/docview_icons.h"
 
 #define TAG "Docview"
 
@@ -34,11 +34,6 @@
 
 #define BLE_CHUNK_SIZE       512
 #define BLE_TRANSFER_TIMEOUT 30000
-
-static bool docview_navigation_exit_callback(void* context) {
-    UNUSED(context);
-    return true;
-}
 
 static bool docview_navigation_submenu_callback(void* context) {
     UNUSED(context);
@@ -124,33 +119,7 @@ static bool Docview_load_document(DocviewReaderModel* model) {
     return success;
 }
 
-static const char* font_size_config_label = "Font Size";
-static char* font_size_names[] = {"Tiny", "Large"};
 static const uint8_t font_sizes[] = {2, 3};
-
-static void Docview_font_size_change(VariableItem* item) {
-    DocviewApp* app = variable_item_get_context(item);
-    uint8_t index = variable_item_get_current_value_index(item);
-    variable_item_set_current_value_text(item, font_size_names[index]);
-
-    with_view_model(
-        app->view_reader,
-        DocviewReaderModel * model,
-        { model->font_size = font_sizes[index]; },
-        true);
-}
-
-static const char* auto_scroll_config_label = "Auto-scroll";
-static char* auto_scroll_names[] = {"Off", "On"};
-
-static void Docview_auto_scroll_change(VariableItem* item) {
-    DocviewApp* app = variable_item_get_context(item);
-    uint8_t index = variable_item_get_current_value_index(item);
-    variable_item_set_current_value_text(item, auto_scroll_names[index]);
-
-    with_view_model(
-        app->view_reader, DocviewReaderModel * model, { model->auto_scroll = (index == 1); }, true);
-}
 
 static void Docview_view_reader_draw_callback(Canvas* canvas, void* model) {
     DocviewReaderModel* my_model = (DocviewReaderModel*)model;
@@ -710,27 +679,26 @@ void docview_ble_transfer_stop(DocviewApp* app) {
     furi_mutex_release(app->ble_state.mutex);
 }
 
-// We need proper callback function for file browser that matches FileBrowserCallback signature
-// and adapter function to work with our existing code
-static void docview_file_browser_void_callback(void* context) {
-    // This function will be called when file selection is completed
-    // The selected path is already stored in the file_browser's result_path
+void docview_file_browser_void_callback(void* context) {
     DocviewApp* app = context;
     if(!app || !app->file_browser) return;
 
-    // Get the selected path from file browser
+    // Create a temporary FuriString to store the path
     FuriString* path = furi_string_alloc();
-    file_browser_get_result_path(app->file_browser, path);
 
+    // Get the path from the file browser and store it in path
+    file_browser_get_path(app->file_browser, path);
+
+    // Only proceed if the path is not empty
     if(!furi_string_empty(path)) {
-        // Call our existing function with the path
+        // Call the regular callback with the path string
         docview_file_browser_callback(furi_string_get_cstr(path), app);
     }
 
+    // Free the temporary string
     furi_string_free(path);
 }
 
-// Original callback remains for other usages
 bool docview_file_browser_callback(const char* path, void* context) {
     DocviewApp* app = context;
     if(!app || !path) return false;
@@ -757,21 +725,25 @@ static void docview_submenu_callback(void* context, uint32_t index) {
     switch(index) {
     case DocviewSubmenuIndexOpenFile:
         if(!app->file_browser) {
+            // Initialize the file path string if needed
+            if(!app->ble_state.file_path) {
+                app->ble_state.file_path = furi_string_alloc();
+            }
+
+            // Start with the documents folder path
             FuriString* path = furi_string_alloc_set(DOCUMENTS_FOLDER_PATH);
             app->file_browser = file_browser_alloc(path);
             furi_string_free(path);
-
-            file_browser_configure(
-                app->file_browser, DOCUMENT_EXT_FILTER, NULL, true, false, NULL, NULL);
-
-            // Use the void callback that matches FileBrowserCallback signature
-            file_browser_set_callback(app->file_browser, docview_file_browser_void_callback, app);
         }
 
-        // Prepare a path for the result
-        FuriString* result_path = furi_string_alloc();
-        file_browser_start(app->file_browser, result_path);
-        furi_string_free(result_path);
+        file_browser_configure(
+            app->file_browser, DOCUMENT_EXT_FILTER, NULL, true, false, NULL, NULL);
+
+        // Set the callback to handle file selection
+        file_browser_set_callback(app->file_browser, docview_file_browser_void_callback, app);
+
+        // Start the file browser with the current path or default
+        file_browser_start(app->file_browser, app->ble_state.file_path);
         break;
 
     case DocviewSubmenuIndexBleAirdrop:
@@ -814,15 +786,18 @@ static View* docview_reader_view_alloc(DocviewApp* app) {
     return view;
 }
 
-static bool docview_init_views(DocviewApp* app) {
+bool docview_init_views(DocviewApp* app) {
     app->submenu = submenu_alloc();
 
     submenu_add_item(
         app->submenu, "Open Document", DocviewSubmenuIndexOpenFile, docview_submenu_callback, app);
+
     submenu_add_item(
         app->submenu, "BLE Airdrop", DocviewSubmenuIndexBleAirdrop, docview_submenu_callback, app);
+
     submenu_add_item(
         app->submenu, "Settings", DocviewSubmenuIndexSettings, docview_submenu_callback, app);
+
     submenu_add_item(
         app->submenu, "About", DocviewSubmenuIndexAbout, docview_submenu_callback, app);
 
@@ -869,7 +844,6 @@ void docview_ble_status_changed_callback(BtStatus status, void* context) {
 DocviewApp* Docview_app_alloc(void) {
     DocviewApp* app = malloc(sizeof(DocviewApp));
     if(!app) return NULL;
-
     memset(app, 0, sizeof(DocviewApp));
 
     app->mutex = furi_mutex_alloc(FuriMutexTypeNormal);
@@ -909,6 +883,7 @@ void Docview_app_free(DocviewApp* app) {
     if(app->ble_state.mutex) {
         furi_mutex_free(app->ble_state.mutex);
     }
+
     if(app->ble_state.file_path) {
         furi_string_free(app->ble_state.file_path);
     }
@@ -936,8 +911,8 @@ void Docview_app_free(DocviewApp* app) {
 
 int32_t main_Docview_app(void* p) {
     UNUSED(p);
-    DocviewApp* app = NULL;
     int32_t ret = 255;
+    DocviewApp* app = NULL;
 
     if(!furi_hal_bt_is_alive()) {
         FURI_LOG_E(TAG, "Bluetooth system not alive");
@@ -974,6 +949,8 @@ int32_t main_Docview_app(void* p) {
         app->ble_state.transfer_active = false;
         app->ble_state.thread = NULL;
         app->ble_state.timeout_timer = NULL;
+
+        // Always allocate file path string
         app->ble_state.file_path = furi_string_alloc();
         if(!app->ble_state.file_path) {
             FURI_LOG_E(TAG, "Failed to allocate file path string");
@@ -989,13 +966,12 @@ int32_t main_Docview_app(void* p) {
         }
 
         view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewSubmenu);
-
         view_dispatcher_run(app->view_dispatcher);
-        ret = 0;
 
+        ret = 0;
     } while(0);
 
-    // Safely cleanup resources
+    // Cleanup
     if(app) {
         Docview_app_free(app);
     } else {

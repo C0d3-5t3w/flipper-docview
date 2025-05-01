@@ -15,16 +15,12 @@ App(
     fap_weburl="https://github.com/C0d3-5t3w/flipper-docview",
     fap_icon_assets="images",  # Image assets to compile for this application
     
-    # We implement our own BT compatibility layer
-    
     # Include all required source files
     sources=[
         "docview.c", 
-        "bt_service.c",
-        "ble_transport.c",
+        "ble/bt_service.c",
+        "ble/ble_transport.c",
         "icons/ble_icons.c",
-    ],
-    
-    # Include header files
-    cdefines=["DOCVIEW_VERSION=\"1.0\""],
+        "files/file_browser_utils.c",
+    ]
 )

@@ -132,6 +132,13 @@ void docview_ble_timeout_callback(void* context);
 bool docview_file_browser_callback(const char* path, void* context);
 void docview_file_browser_void_callback(void* context);
 
+// Forward declaration of FileBrowser callback type to avoid conflicts
+typedef void (*FileBrowserCallback)(void* context);
+
+// DO NOT define the FileBrowser API functions here
+// Let the compiler use the ones from the Flipper OS headers
+// This prevents conflicting types errors
+
 // Process callback - non-static declaration
 int32_t docview_ble_transfer_process_callback(void* context); 
 
