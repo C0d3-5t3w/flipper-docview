@@ -86,7 +86,6 @@ typedef struct DocviewApp {
 
     // BLE state
     BleTransferState ble_state;
-    Bt* bt;
     
     // Rest of the struct members
     NotificationApp* notifications;  
@@ -118,11 +117,23 @@ typedef struct {
     bool long_line_detected;       
 } DocviewReaderModel;
 
-// Function declarations
+// Application functions
+DocviewApp* Docview_app_alloc(void); 
+void Docview_app_free(DocviewApp* app);
+
+// BLE callback functions
+void docview_ble_status_changed_callback(BtStatus status, void* context);
 void docview_ble_transfer_start(DocviewApp* app);
 void docview_ble_transfer_stop(DocviewApp* app);
 void docview_ble_transfer_update_status(DocviewApp* app);
 void docview_ble_timeout_callback(void* context);
-int32_t docview_ble_transfer_process_callback(void* context);
-void docview_ble_status_changed_callback(BtStatus status, void* context);
-void Docview_submenu_callback(void* context, uint32_t index);
+
+// File browsing helper declarations
+bool docview_file_browser_callback(const char* path, void* context);
+void docview_file_browser_void_callback(void* context);
+
+// Process callback - non-static declaration
+int32_t docview_ble_transfer_process_callback(void* context); 
+
+// Entry point
+int32_t main_Docview_app(void* p);

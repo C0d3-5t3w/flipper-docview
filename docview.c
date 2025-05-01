@@ -18,7 +18,7 @@
 
 #include "docview_app.h"
 #include "bt_service.h"
-// #include "bt_hal_compat.h"
+#include "docview_icons.h"
 
 #define TAG "Docview"
 
@@ -35,14 +35,19 @@
 #define BLE_CHUNK_SIZE       512
 #define BLE_TRANSFER_TIMEOUT 30000
 
-static uint32_t Docview_navigation_exit_callback(void* _context) {
-    UNUSED(_context);
-    return VIEW_NONE;
+static bool docview_navigation_exit_callback(void* context) {
+    UNUSED(context);
+    return true;
 }
 
-static uint32_t Docview_navigation_submenu_callback(void* _context) {
-    UNUSED(_context);
-    return DocviewViewSubmenu;
+static bool docview_navigation_submenu_callback(void* context) {
+    UNUSED(context);
+    view_dispatcher_switch_to_view(((DocviewApp*)context)->view_dispatcher, DocviewViewSubmenu);
+    return true;
+}
+
+static void docview_navigation_submenu_void_callback(void* context) {
+    docview_navigation_submenu_callback(context);
 }
 
 static bool is_binary_content(const char* buffer, size_t size) {
@@ -457,10 +462,239 @@ static bool Docview_view_reader_input_callback(InputEvent* event, void* context)
     return false;
 }
 
+int32_t docview_ble_transfer_process_callback(void* context) {
+    DocviewApp* app = context;
+    furi_assert(app);
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* file = storage_file_alloc(storage);
+    uint8_t* buffer = malloc(BLE_CHUNK_SIZE);
+    bool success = false;
+
+    do {
+        if(!storage_file_open(
+               file,
+               furi_string_get_cstr(app->ble_state.file_path),
+               FSAM_READ,
+               FSOM_OPEN_EXISTING)) {
+            break;
+        }
+
+        if(!ble_file_service_start_transfer(app->ble_state.file_name, app->ble_state.file_size)) {
+            break;
+        }
+
+        app->ble_state.status = BleTransferStatusTransferring;
+        docview_ble_transfer_update_status(app);
+
+        while(app->ble_state.bytes_sent < app->ble_state.file_size) {
+            // Check stop flag
+            uint32_t flags = furi_thread_flags_get();
+            if(flags & BLE_THREAD_FLAG_STOP) break;
+
+            size_t bytes_read = storage_file_read(file, buffer, BLE_CHUNK_SIZE);
+            if(bytes_read == 0) break;
+
+            if(!ble_file_service_send(buffer, bytes_read)) {
+                break;
+            }
+
+            app->ble_state.bytes_sent += bytes_read;
+            app->ble_state.chunks_sent++;
+            docview_ble_transfer_update_status(app);
+        }
+
+        if(app->ble_state.bytes_sent == app->ble_state.file_size) {
+            success = ble_file_service_end_transfer();
+        }
+
+    } while(0);
+
+    // Cleanup
+    storage_file_close(file);
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+    free(buffer);
+
+    // Update final status
+    furi_mutex_acquire(app->ble_state.mutex, FuriWaitForever);
+    app->ble_state.status = success ? BleTransferStatusComplete : BleTransferStatusFailed;
+    docview_ble_transfer_update_status(app);
+    furi_mutex_release(app->ble_state.mutex);
+
+    return 0;
+}
+
+void docview_ble_transfer_update_status(DocviewApp* app) {
+    furi_assert(app);
+    furi_assert(app->popup_ble);
+
+    if(!furi_mutex_acquire(app->ble_state.mutex, 100)) {
+        return;
+    }
+
+    // Update popup based on transfer status
+    popup_reset(app->popup_ble);
+
+    switch(app->ble_state.status) {
+    case BleTransferStatusIdle:
+        popup_set_header(app->popup_ble, "BLE File Transfer", 64, 2, AlignCenter, AlignTop);
+        popup_set_text(app->popup_ble, "Ready", 64, 32, AlignCenter, AlignTop);
+        popup_set_icon(app->popup_ble, 0, 12, &I_BleWaitConnecting_15x15);
+        break;
+
+    case BleTransferStatusAdvertising:
+        popup_set_header(app->popup_ble, "BLE File Transfer", 64, 2, AlignCenter, AlignTop);
+        popup_set_text(app->popup_ble, "Waiting for connection...", 64, 32, AlignCenter, AlignTop);
+        popup_set_icon(app->popup_ble, 0, 12, &I_BleWaitConnecting_15x15);
+        break;
+
+    case BleTransferStatusConnected:
+        popup_set_header(app->popup_ble, "BLE File Transfer", 64, 2, AlignCenter, AlignTop);
+        popup_set_text(
+            app->popup_ble, "Connected\nPreparing transfer...", 64, 32, AlignCenter, AlignTop);
+        popup_set_icon(app->popup_ble, 0, 12, &I_BleConnected_15x15);
+        break;
+
+    case BleTransferStatusTransferring: {
+        char progress_str[32];
+        float progress = 0.0f;
+        if(app->ble_state.file_size > 0) {
+            progress = (float)app->ble_state.bytes_sent / (float)app->ble_state.file_size * 100.0f;
+        }
+        snprintf(
+            progress_str,
+            sizeof(progress_str),
+            "%.1f%% (%lu/%lu KB)",
+            (double)progress,
+            (unsigned long)app->ble_state.bytes_sent / 1024,
+            (unsigned long)app->ble_state.file_size / 1024);
+
+        popup_set_header(app->popup_ble, "BLE File Transfer", 64, 2, AlignCenter, AlignTop);
+        popup_set_text(app->popup_ble, progress_str, 64, 32, AlignCenter, AlignTop);
+        popup_set_icon(app->popup_ble, 0, 12, &I_Loading_10x10);
+
+        // Show file name
+        char file_info[64];
+        snprintf(file_info, sizeof(file_info), "File: %s", app->ble_state.file_name);
+        popup_set_text(app->popup_ble, file_info, 64, 42, AlignCenter, AlignTop);
+        break;
+    }
+
+    case BleTransferStatusComplete:
+        popup_set_header(app->popup_ble, "Transfer Complete", 64, 2, AlignCenter, AlignTop);
+        popup_set_text(app->popup_ble, "File sent successfully", 64, 32, AlignCenter, AlignTop);
+        popup_set_icon(app->popup_ble, 0, 12, &I_Ok_15x15);
+        popup_set_callback(app->popup_ble, docview_navigation_submenu_void_callback);
+        popup_set_context(app->popup_ble, app);
+        popup_set_timeout(app->popup_ble, 3000);
+        break;
+
+    case BleTransferStatusFailed:
+        popup_set_header(app->popup_ble, "Transfer Failed", 64, 2, AlignCenter, AlignTop);
+        popup_set_text(app->popup_ble, "Error sending file", 64, 32, AlignCenter, AlignTop);
+        popup_set_icon(app->popup_ble, 0, 12, &I_Error_15x15);
+        popup_set_callback(app->popup_ble, docview_navigation_submenu_void_callback);
+        popup_set_context(app->popup_ble, app);
+        popup_set_timeout(app->popup_ble, 3000);
+        break;
+    }
+
+    furi_mutex_release(app->ble_state.mutex);
+    view_dispatcher_send_custom_event(app->view_dispatcher, DocviewEventIdRedrawScreen);
+}
+
+void docview_ble_timeout_callback(void* context) {
+    DocviewApp* app = context;
+    furi_assert(app);
+
+    furi_mutex_acquire(app->ble_state.mutex, FuriWaitForever);
+    if(app->ble_state.status != BleTransferStatusComplete) {
+        app->ble_state.status = BleTransferStatusFailed;
+        docview_ble_transfer_update_status(app);
+    }
+    furi_mutex_release(app->ble_state.mutex);
+
+    docview_ble_transfer_stop(app);
+}
+
+void docview_ble_transfer_start(DocviewApp* app) {
+    furi_assert(app);
+
+    if(app->ble_state.transfer_active) {
+        return;
+    }
+
+    // Initialize mutex if not already done
+    if(!app->ble_state.mutex) {
+        app->ble_state.mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    }
+
+    furi_mutex_acquire(app->ble_state.mutex, FuriWaitForever);
+
+    // Initialize BLE state
+    app->ble_state.status = BleTransferStatusAdvertising;
+    app->ble_state.bytes_sent = 0;
+    app->ble_state.chunks_sent = 0;
+
+    // Get file size
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    FileInfo file_info;
+    if(storage_common_stat(storage, furi_string_get_cstr(app->ble_state.file_path), &file_info) ==
+       FSE_OK) {
+        app->ble_state.file_size = file_info.size;
+    } else {
+        app->ble_state.file_size = 0;
+    }
+    furi_record_close(RECORD_STORAGE);
+
+    // Initialize file service
+    if(!ble_file_service_init()) {
+        app->ble_state.status = BleTransferStatusFailed;
+        docview_ble_transfer_update_status(app);
+        furi_mutex_release(app->ble_state.mutex);
+        return;
+    }
+
+    app->ble_state.transfer_active = true;
+
+    // Set up timeout
+    app->ble_state.timeout_timer =
+        furi_timer_alloc(docview_ble_timeout_callback, FuriTimerTypeOnce, app);
+    if(app->ble_state.timeout_timer) {
+        furi_timer_start(app->ble_state.timeout_timer, BLE_TRANSFER_TIMEOUT);
+    }
+
+    // Update UI
+    docview_ble_transfer_update_status(app);
+    furi_mutex_release(app->ble_state.mutex);
+
+    // Create and start transfer thread
+    if(!app->ble_state.thread) {
+        app->ble_state.thread = furi_thread_alloc();
+        furi_thread_set_name(app->ble_state.thread, "DocviewBLETransfer");
+        furi_thread_set_stack_size(app->ble_state.thread, 2048);
+        furi_thread_set_callback(app->ble_state.thread, docview_ble_transfer_process_callback);
+        furi_thread_set_context(app->ble_state.thread, app);
+        furi_thread_start(app->ble_state.thread);
+    }
+}
+
 void docview_ble_transfer_stop(DocviewApp* app) {
     furi_assert(app);
 
-    // Signal thread to stop
+    if(!app->ble_state.transfer_active) {
+        return;
+    }
+
+    // Stop timeout timer
+    if(app->ble_state.timeout_timer) {
+        furi_timer_stop(app->ble_state.timeout_timer);
+        furi_timer_free(app->ble_state.timeout_timer);
+        app->ble_state.timeout_timer = NULL;
+    }
+
+    // Signal thread to stop and wait for it
     if(app->ble_state.thread) {
         furi_thread_flags_set(furi_thread_get_id(app->ble_state.thread), BLE_THREAD_FLAG_STOP);
         furi_thread_join(app->ble_state.thread);
@@ -468,157 +702,154 @@ void docview_ble_transfer_stop(DocviewApp* app) {
         app->ble_state.thread = NULL;
     }
 
-    if(app->ble_state.timeout_timer) {
-        furi_timer_stop(app->ble_state.timeout_timer);
-        furi_timer_free(app->ble_state.timeout_timer);
-        app->ble_state.timeout_timer = NULL;
-    }
-
-    if(app->ble_state.mutex) {
-        furi_mutex_free(app->ble_state.mutex);
-        app->ble_state.mutex = NULL;
-    }
-
-    app->ble_state.transfer_active = false;
+    // Clean up BLE services
     ble_file_service_deinit();
+
+    furi_mutex_acquire(app->ble_state.mutex, FuriWaitForever);
+    app->ble_state.transfer_active = false;
+    furi_mutex_release(app->ble_state.mutex);
 }
 
-void docview_ble_transfer_start(DocviewApp* app) {
+// We need proper callback function for file browser that matches FileBrowserCallback signature
+// and adapter function to work with our existing code
+static void docview_file_browser_void_callback(void* context) {
+    // This function will be called when file selection is completed
+    // The selected path is already stored in the file_browser's result_path
+    DocviewApp* app = context;
+    if(!app || !app->file_browser) return;
+
+    // Get the selected path from file browser
+    FuriString* path = furi_string_alloc();
+    file_browser_get_result_path(app->file_browser, path);
+
+    if(!furi_string_empty(path)) {
+        // Call our existing function with the path
+        docview_file_browser_callback(furi_string_get_cstr(path), app);
+    }
+
+    furi_string_free(path);
+}
+
+// Original callback remains for other usages
+bool docview_file_browser_callback(const char* path, void* context) {
+    DocviewApp* app = context;
+    if(!app || !path) return false;
+
+    with_view_model(
+        app->view_reader,
+        DocviewReaderModel * model,
+        {
+            strlcpy(model->document_path, path, sizeof(model->document_path));
+            model->is_document_loaded = false;
+            model->scroll_position = 0;
+            model->h_scroll_offset = 0;
+        },
+        true);
+
+    view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewReader);
+    return true;
+}
+
+static void docview_submenu_callback(void* context, uint32_t index) {
+    DocviewApp* app = context;
     furi_assert(app);
 
-    // Initialize mutex first
-    app->ble_state.mutex = furi_mutex_alloc(FuriMutexTypeNormal);
-    if(!app->ble_state.mutex) {
-        app->ble_state.status = BleTransferStatusFailed;
-        return;
+    switch(index) {
+    case DocviewSubmenuIndexOpenFile:
+        if(!app->file_browser) {
+            FuriString* path = furi_string_alloc_set(DOCUMENTS_FOLDER_PATH);
+            app->file_browser = file_browser_alloc(path);
+            furi_string_free(path);
+
+            file_browser_configure(
+                app->file_browser, DOCUMENT_EXT_FILTER, NULL, true, false, NULL, NULL);
+
+            // Use the void callback that matches FileBrowserCallback signature
+            file_browser_set_callback(app->file_browser, docview_file_browser_void_callback, app);
+        }
+
+        // Prepare a path for the result
+        FuriString* result_path = furi_string_alloc();
+        file_browser_start(app->file_browser, result_path);
+        furi_string_free(result_path);
+        break;
+
+    case DocviewSubmenuIndexBleAirdrop:
+        if(app->ble_state.file_path && !furi_string_empty(app->ble_state.file_path)) {
+            view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewBleTransfer);
+            docview_ble_transfer_start(app);
+        }
+        break;
+
+    case DocviewSubmenuIndexSettings:
+        break;
+
+    case DocviewSubmenuIndexAbout:
+        break;
     }
-
-    // Initialize BLE state
-    app->ble_state.status = BleTransferStatusIdle;
-    app->ble_state.chunks_sent = 0;
-    app->ble_state.bytes_sent = 0;
-    app->ble_state.transfer_active = true;
-
-    // Get file info
-    Storage* storage = furi_record_open(RECORD_STORAGE);
-    FileInfo file_info;
-
-    if(storage_common_stat(storage, furi_string_get_cstr(app->ble_state.file_path), &file_info) ==
-       FSE_OK) {
-        app->ble_state.file_size = file_info.size;
-        app->ble_state.total_chunks = (file_info.size + BLE_CHUNK_SIZE - 1) / BLE_CHUNK_SIZE;
-    } else {
-        app->ble_state.status = BleTransferStatusFailed;
-        furi_record_close(RECORD_STORAGE);
-        return;
-    }
-
-    furi_record_close(RECORD_STORAGE);
-
-    // Initialize BLE service
-    if(!ble_file_service_init()) {
-        app->ble_state.status = BleTransferStatusFailed;
-        docview_ble_transfer_update_status(app);
-        return;
-    }
-
-    app->ble_state.status = BleTransferStatusAdvertising;
-    docview_ble_transfer_update_status(app);
-
-    // Start timeout timer
-    app->ble_state.timeout_timer =
-        furi_timer_alloc(docview_ble_timeout_callback, FuriTimerTypeOnce, app);
-    if(!app->ble_state.timeout_timer) {
-        docview_ble_transfer_stop(app);
-        return;
-    }
-    furi_timer_start(app->ble_state.timeout_timer, BLE_TRANSFER_TIMEOUT);
-
-    // Start transfer thread
-    app->ble_state.thread =
-        furi_thread_alloc_ex("BleTransfer", 2048, docview_ble_transfer_process_callback, app);
-    if(!app->ble_state.thread) {
-        docview_ble_transfer_stop(app);
-        return;
-    }
-    furi_thread_start(app->ble_state.thread);
 }
 
-void docview_ble_transfer_update_status(DocviewApp* app) {
-    const char* status_text;
-    FuriString* temp_str = furi_string_alloc();
+static View* docview_reader_view_alloc(DocviewApp* app) {
+    View* view = view_alloc();
+    view_allocate_model(view, ViewModelTypeLocking, sizeof(DocviewReaderModel));
 
-    switch(app->ble_state.status) {
-    case BleTransferStatusAdvertising:
-        status_text = "Waiting for connection\nFile: %s\nSize: %lu bytes";
-        furi_string_printf(
-            temp_str, status_text, app->ble_state.file_name, app->ble_state.file_size);
-        popup_set_header(app->popup_ble, "BLE File Transfer", 64, 11, AlignCenter, AlignCenter);
-        popup_set_text(
-            app->popup_ble, furi_string_get_cstr(temp_str), 64, 32, AlignCenter, AlignCenter);
-        break;
+    with_view_model(
+        view,
+        DocviewReaderModel * model,
+        {
+            model->font_size = font_sizes[0];
+            model->scroll_position = 0;
+            model->h_scroll_offset = 0;
+            model->auto_scroll = false;
+            model->is_document_loaded = false;
+        },
+        true);
 
-    case BleTransferStatusConnected:
-        status_text = "Connected\nPreparing to send %s";
-        furi_string_printf(temp_str, status_text, app->ble_state.file_name);
-        popup_set_header(app->popup_ble, "BLE File Transfer", 64, 11, AlignCenter, AlignCenter);
-        popup_set_text(
-            app->popup_ble, furi_string_get_cstr(temp_str), 64, 32, AlignCenter, AlignCenter);
-        break;
+    view_set_context(view, app);
+    view_set_draw_callback(view, Docview_view_reader_draw_callback);
+    view_set_input_callback(view, Docview_view_reader_input_callback);
+    view_set_enter_callback(view, Docview_view_reader_enter_callback);
+    view_set_exit_callback(view, Docview_view_reader_exit_callback);
 
-    case BleTransferStatusTransferring: {
-        int progress = (app->ble_state.chunks_sent * 100) / app->ble_state.total_chunks;
-        status_text = "Sending: %s\n%d%% (%lu/%lu bytes)";
-        furi_string_printf(
-            temp_str,
-            status_text,
-            app->ble_state.file_name,
-            progress,
-            app->ble_state.bytes_sent,
-            app->ble_state.file_size);
-        popup_set_header(app->popup_ble, "BLE File Transfer", 64, 11, AlignCenter, AlignCenter);
-        popup_set_text(
-            app->popup_ble, furi_string_get_cstr(temp_str), 64, 32, AlignCenter, AlignCenter);
-        break;
-    }
-
-    case BleTransferStatusComplete:
-        status_text = "Transfer complete\nFile: %s\nSize: %lu bytes";
-        furi_string_printf(
-            temp_str, status_text, app->ble_state.file_name, app->ble_state.file_size);
-        popup_set_header(app->popup_ble, "BLE File Transfer", 64, 11, AlignCenter, AlignCenter);
-        popup_set_text(
-            app->popup_ble, furi_string_get_cstr(temp_str), 64, 32, AlignCenter, AlignCenter);
-        break;
-
-    case BleTransferStatusFailed:
-        status_text = "Transfer failed\nFile: %s";
-        furi_string_printf(temp_str, status_text, app->ble_state.file_name);
-        popup_set_header(app->popup_ble, "BLE File Transfer", 64, 11, AlignCenter, AlignCenter);
-        popup_set_text(
-            app->popup_ble, furi_string_get_cstr(temp_str), 64, 32, AlignCenter, AlignCenter);
-        break;
-
-    default:
-        break;
-    }
-
-    furi_string_free(temp_str);
-
-    view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewBleTransfer);
+    return view;
 }
 
-void docview_ble_timeout_callback(void* context) {
-    DocviewApp* app = context;
+static bool docview_init_views(DocviewApp* app) {
+    app->submenu = submenu_alloc();
 
-    app->ble_state.status = BleTransferStatusFailed;
-    docview_ble_transfer_update_status(app);
+    submenu_add_item(
+        app->submenu, "Open Document", DocviewSubmenuIndexOpenFile, docview_submenu_callback, app);
+    submenu_add_item(
+        app->submenu, "BLE Airdrop", DocviewSubmenuIndexBleAirdrop, docview_submenu_callback, app);
+    submenu_add_item(
+        app->submenu, "Settings", DocviewSubmenuIndexSettings, docview_submenu_callback, app);
+    submenu_add_item(
+        app->submenu, "About", DocviewSubmenuIndexAbout, docview_submenu_callback, app);
 
-    docview_ble_transfer_stop(app);
+    view_dispatcher_add_view(
+        app->view_dispatcher, DocviewViewSubmenu, submenu_get_view(app->submenu));
+
+    app->view_reader = docview_reader_view_alloc(app);
+    view_dispatcher_add_view(app->view_dispatcher, DocviewViewReader, app->view_reader);
+
+    app->popup_ble = popup_alloc();
+    view_dispatcher_add_view(
+        app->view_dispatcher, DocviewViewBleTransfer, popup_get_view(app->popup_ble));
+
+    view_dispatcher_enable_queue(app->view_dispatcher);
+    view_dispatcher_set_event_callback_context(app->view_dispatcher, app);
+
+    view_dispatcher_set_navigation_event_callback(
+        app->view_dispatcher, docview_navigation_submenu_callback);
+
+    return true;
 }
 
 void docview_ble_status_changed_callback(BtStatus status, void* context) {
     DocviewApp* app = context;
+    furi_assert(app);
+
+    furi_mutex_acquire(app->ble_state.mutex, FuriWaitForever);
 
     if(status == BtStatusConnected) {
         app->ble_state.status = BleTransferStatusConnected;
@@ -631,188 +862,22 @@ void docview_ble_status_changed_callback(BtStatus status, void* context) {
     if(status != BtStatusConnected && app->ble_state.status == BleTransferStatusConnected) {
         docview_ble_transfer_stop(app);
     }
+
+    furi_mutex_release(app->ble_state.mutex);
 }
 
-int32_t docview_ble_transfer_process_callback(void* context) {
-    DocviewApp* app = context;
-    bool success = false;
-
-    Storage* storage = furi_record_open(RECORD_STORAGE);
-    File* file = storage_file_alloc(storage);
-
-    if(storage_file_open(
-           file, furi_string_get_cstr(app->ble_state.file_path), FSAM_READ, FSOM_OPEN_EXISTING)) {
-        if(ble_file_service_start_transfer(app->ble_state.file_name, app->ble_state.file_size)) {
-            app->ble_state.status = BleTransferStatusTransferring;
-            docview_ble_transfer_update_status(app);
-
-            uint8_t* chunk_buffer = malloc(BLE_CHUNK_SIZE);
-
-            while(app->ble_state.chunks_sent < app->ble_state.total_chunks) {
-                size_t bytes_read = storage_file_read(file, chunk_buffer, BLE_CHUNK_SIZE);
-                if(bytes_read == 0) break;
-
-                if(ble_file_service_send(chunk_buffer, bytes_read)) {
-                    app->ble_state.bytes_sent += bytes_read;
-                    app->ble_state.chunks_sent++;
-
-                    if(app->ble_state.chunks_sent % 5 == 0) {
-                        docview_ble_transfer_update_status(app);
-                    }
-                } else {
-                    break;
-                }
-
-                furi_delay_ms(10);
-            }
-
-            free(chunk_buffer);
-
-            ble_file_service_end_transfer();
-
-            if(app->ble_state.chunks_sent == app->ble_state.total_chunks) {
-                success = true;
-            }
-        }
-    }
-
-    storage_file_close(file);
-    storage_file_free(file);
-    furi_record_close(RECORD_STORAGE);
-
-    if(success) {
-        app->ble_state.status = BleTransferStatusComplete;
-    } else {
-        app->ble_state.status = BleTransferStatusFailed;
-    }
-    docview_ble_transfer_update_status(app);
-
-    docview_ble_transfer_stop(app);
-
-    return 0;
-}
-
-static bool docview_ble_transfer_input_callback(InputEvent* event, void* context) {
-    DocviewApp* app = (DocviewApp*)context;
-
-    if(event->type == InputTypeShort && event->key == InputKeyBack) {
-        docview_ble_transfer_stop(app);
-        view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewReader);
-        return true;
-    }
-
-    return false;
-}
-
-static bool file_select_callback(
-    FuriString* path,
-    void* context,
-    uint8_t** icon_ptr,
-    FuriString* filename_str) {
-    UNUSED(filename_str);
-    UNUSED(icon_ptr);
-    DocviewApp* app = context;
-
-    if(furi_string_empty(path)) {
-        view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewSubmenu);
-        return false;
-    }
-
-    with_view_model(
-        app->view_reader,
-        DocviewReaderModel * model,
-        {
-            strlcpy(
-                model->document_path, furi_string_get_cstr(path), sizeof(model->document_path));
-            model->is_document_loaded = false;
-            model->scroll_position = 0;
-            model->h_scroll_offset = 0;
-        },
-        true);
-
-    view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewReader);
-    return true;
-}
-
-static bool airdrop_file_select_callback(
-    FuriString* path,
-    void* context,
-    uint8_t** icon_ptr,
-    FuriString* filename_str) {
-    UNUSED(filename_str);
-    UNUSED(icon_ptr);
-    DocviewApp* app = context;
-
-    if(furi_string_empty(path)) {
-        view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewSubmenu);
-        return false;
-    }
-
-    if(app->ble_state.file_path) {
-        furi_string_free(app->ble_state.file_path);
-    }
-    app->ble_state.file_path = furi_string_alloc_set(path);
-
-    FuriString* filename = furi_string_alloc();
-    path_extract_filename(path, filename, true);
-    strlcpy(
-        app->ble_state.file_name,
-        furi_string_get_cstr(filename),
-        sizeof(app->ble_state.file_name));
-    furi_string_free(filename);
-
-    view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewBleTransfer);
-    docview_ble_transfer_start(app);
-    return true;
-}
-
-static void file_browser_callback(void* context) {
-    DocviewApp* app = context;
-    view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewSubmenu);
-}
-
-void Docview_submenu_callback(void* context, uint32_t index) {
-    DocviewApp* app = context;
-
-    if(index == DocviewSubmenuIndexOpenFile) {
-        file_browser_stop(app->file_browser);
-        file_browser_set_callback(app->file_browser, file_browser_callback, app);
-        file_browser_set_item_callback(app->file_browser, file_select_callback, app);
-
-        FuriString* path = furi_string_alloc_set_str(DOCUMENTS_FOLDER_PATH);
-        file_browser_start(app->file_browser, path);
-        furi_string_free(path);
-
-        view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewFileBrowser);
-    } else if(index == DocviewSubmenuIndexBleAirdrop) {
-        file_browser_stop(app->file_browser);
-        file_browser_set_callback(app->file_browser, file_browser_callback, app);
-        file_browser_set_item_callback(app->file_browser, airdrop_file_select_callback, app);
-
-        FuriString* path = furi_string_alloc_set_str(DOCUMENTS_FOLDER_PATH);
-        file_browser_start(app->file_browser, path);
-        furi_string_free(path);
-
-        view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewFileBrowser);
-    } else if(index == DocviewSubmenuIndexSettings) {
-        view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewConfigure);
-    } else if(index == DocviewSubmenuIndexAbout) {
-        view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewAbout);
-    }
-}
-
-static DocviewApp* Docview_app_alloc() {
+DocviewApp* Docview_app_alloc(void) {
     DocviewApp* app = malloc(sizeof(DocviewApp));
     if(!app) return NULL;
 
-    // Core resources initialization
+    memset(app, 0, sizeof(DocviewApp));
+
     app->mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     if(!app->mutex) {
         free(app);
         return NULL;
     }
 
-    // GUI must be initialized before view system
     app->gui = furi_record_open(RECORD_GUI);
     if(!app->gui) {
         furi_mutex_free(app->mutex);
@@ -820,7 +885,6 @@ static DocviewApp* Docview_app_alloc() {
         return NULL;
     }
 
-    // Initialize view dispatcher
     app->view_dispatcher = view_dispatcher_alloc();
     if(!app->view_dispatcher) {
         furi_record_close(RECORD_GUI);
@@ -829,166 +893,36 @@ static DocviewApp* Docview_app_alloc() {
         return NULL;
     }
 
-    // Initialize BLE last
-    if(!bt_service_init()) {
-        view_dispatcher_free(app->view_dispatcher);
-        furi_record_close(RECORD_GUI);
-        furi_mutex_free(app->mutex);
-        free(app);
-        return NULL;
-    }
-
-    // Rest of initialization
-    Storage* storage = furi_record_open(RECORD_STORAGE);
-    if(!storage_dir_exists(storage, DOCUMENTS_FOLDER_PATH)) {
-        storage_simply_mkdir(storage, DOCUMENTS_FOLDER_PATH);
-    }
-    furi_record_close(RECORD_STORAGE);
-
-    app->submenu = submenu_alloc();
-    submenu_add_item(
-        app->submenu, "Open File", DocviewSubmenuIndexOpenFile, Docview_submenu_callback, app);
-    submenu_add_item(
-        app->submenu, "BLE Airdrop", DocviewSubmenuIndexBleAirdrop, Docview_submenu_callback, app);
-    submenu_add_item(
-        app->submenu, "Settings", DocviewSubmenuIndexSettings, Docview_submenu_callback, app);
-    submenu_add_item(
-        app->submenu, "About", DocviewSubmenuIndexAbout, Docview_submenu_callback, app);
-
-    view_set_previous_callback(submenu_get_view(app->submenu), Docview_navigation_exit_callback);
-    view_dispatcher_add_view(
-        app->view_dispatcher, DocviewViewSubmenu, submenu_get_view(app->submenu));
-    view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewSubmenu);
-
-    app->text_input = text_input_alloc();
-    view_dispatcher_add_view(
-        app->view_dispatcher, DocviewViewTextInput, text_input_get_view(app->text_input));
-
-    app->temp_buffer_size = 32;
-    app->temp_buffer = (char*)malloc(app->temp_buffer_size);
-
-    app->variable_item_list_config = variable_item_list_alloc();
-    variable_item_list_reset(app->variable_item_list_config);
-
-    VariableItem* item = variable_item_list_add(
-        app->variable_item_list_config,
-        font_size_config_label,
-        COUNT_OF(font_sizes),
-        Docview_font_size_change,
-        app);
-    uint8_t font_size_index = 1;
-    variable_item_set_current_value_index(item, font_size_index);
-    variable_item_set_current_value_text(item, font_size_names[font_size_index]);
-
-    item = variable_item_list_add(
-        app->variable_item_list_config,
-        auto_scroll_config_label,
-        2,
-        Docview_auto_scroll_change,
-        app);
-    uint8_t auto_scroll_index = 0;
-    variable_item_set_current_value_index(item, auto_scroll_index);
-    variable_item_set_current_value_text(item, auto_scroll_names[auto_scroll_index]);
-
-    view_set_previous_callback(
-        variable_item_list_get_view(app->variable_item_list_config),
-        Docview_navigation_submenu_callback);
-    view_dispatcher_add_view(
-        app->view_dispatcher,
-        DocviewViewConfigure,
-        variable_item_list_get_view(app->variable_item_list_config));
-
-    app->view_reader = view_alloc();
-    view_set_draw_callback(app->view_reader, Docview_view_reader_draw_callback);
-    view_set_input_callback(app->view_reader, Docview_view_reader_input_callback);
-    view_set_previous_callback(app->view_reader, Docview_navigation_submenu_callback);
-    view_set_enter_callback(app->view_reader, Docview_view_reader_enter_callback);
-    view_set_exit_callback(app->view_reader, Docview_view_reader_exit_callback);
-    view_set_context(app->view_reader, app);
-
-    view_allocate_model(app->view_reader, ViewModelTypeLockFree, sizeof(DocviewReaderModel));
-    DocviewReaderModel* model = view_get_model(app->view_reader);
-    model->font_size = font_sizes[font_size_index];
-    model->scroll_position = 0;
-    model->h_scroll_offset = 0;
-    model->auto_scroll = (auto_scroll_index == 1);
-    model->is_document_loaded = false;
-    model->total_lines = 0;
-    model->is_binary = false;
-    model->long_line_detected = false;
-    model->document_path[0] = '\0';
-
-    view_dispatcher_add_view(app->view_dispatcher, DocviewViewReader, app->view_reader);
-
-    app->ble_state.status = BleTransferStatusIdle;
-    app->ble_state.file_path = NULL;
-    app->ble_state.timeout_timer = NULL;
-    app->ble_state.thread = NULL;
-
-    app->popup_ble = popup_alloc();
-    view_set_context(popup_get_view(app->popup_ble), app);
-    view_set_input_callback(popup_get_view(app->popup_ble), docview_ble_transfer_input_callback);
-    view_dispatcher_add_view(
-        app->view_dispatcher, DocviewViewBleTransfer, popup_get_view(app->popup_ble));
-
-    app->notifications = furi_record_open(RECORD_NOTIFICATION);
-    app->dialogs = furi_record_open(RECORD_DIALOGS);
-
-    app->bt = NULL;
-    bt_service_subscribe_status(app->bt, docview_ble_status_changed_callback, app);
-
-    FuriString* result_path = furi_string_alloc();
-    app->file_browser = file_browser_alloc(result_path);
-    furi_string_free(result_path);
-
-    view_dispatcher_add_view(
-        app->view_dispatcher, DocviewViewFileBrowser, file_browser_get_view(app->file_browser));
-
     return app;
 }
 
-static void Docview_app_free(DocviewApp* app) {
+void Docview_app_free(DocviewApp* app) {
     furi_assert(app);
 
-    // Stop any active BLE transfers first
     if(app->ble_state.transfer_active) {
         docview_ble_transfer_stop(app);
     }
 
-    // Cleanup BLE/BT resources
+    bt_service_unsubscribe_status();
+    bt_service_deinit();
+
     if(app->ble_state.mutex) {
-        furi_mutex_acquire(app->ble_state.mutex, FuriWaitForever);
-        bt_service_unsubscribe_status(app->bt);
-        bt_service_deinit();
-        furi_mutex_release(app->ble_state.mutex);
         furi_mutex_free(app->ble_state.mutex);
     }
-
-    // Free all remaining BLE state resources
     if(app->ble_state.file_path) {
         furi_string_free(app->ble_state.file_path);
     }
 
-    // Cleanup views in reverse order
+    if(app->file_browser) {
+        file_browser_stop(app->file_browser);
+        file_browser_free(app->file_browser);
+    }
+
     view_dispatcher_remove_view(app->view_dispatcher, DocviewViewBleTransfer);
     popup_free(app->popup_ble);
 
-#ifdef BACKLIGHT_ON
-    notification_message(app->notifications, &sequence_display_backlight_enforce_auto);
-#endif
-    furi_record_close(RECORD_NOTIFICATION);
-    furi_record_close(RECORD_DIALOGS);
-
-    view_dispatcher_remove_view(app->view_dispatcher, DocviewViewTextInput);
-    text_input_free(app->text_input);
-
-    free(app->temp_buffer);
-
     view_dispatcher_remove_view(app->view_dispatcher, DocviewViewReader);
     view_free(app->view_reader);
-
-    view_dispatcher_remove_view(app->view_dispatcher, DocviewViewConfigure);
-    variable_item_list_free(app->variable_item_list_config);
 
     view_dispatcher_remove_view(app->view_dispatcher, DocviewViewSubmenu);
     submenu_free(app->submenu);
@@ -996,53 +930,79 @@ static void Docview_app_free(DocviewApp* app) {
     view_dispatcher_free(app->view_dispatcher);
     furi_record_close(RECORD_GUI);
 
-    view_dispatcher_remove_view(app->view_dispatcher, DocviewViewFileBrowser);
-    file_browser_free(app->file_browser);
-
-    // Free core resources last
-    if(app->mutex) {
-        furi_mutex_free(app->mutex);
-    }
+    furi_mutex_free(app->mutex);
     free(app);
 }
 
 int32_t main_Docview_app(void* p) {
     UNUSED(p);
-    int32_t ret = 255; // Default error return
+    DocviewApp* app = NULL;
+    int32_t ret = 255;
 
-    // Check Furi system state
     if(!furi_hal_bt_is_alive()) {
         FURI_LOG_E(TAG, "Bluetooth system not alive");
         return ret;
     }
 
-    if(!furi_record_exists("bt")) {
-        FURI_LOG_E(TAG, "Bluetooth system not available");
-        return ret;
-    }
-
-    // Initialize Bluetooth stack with error handling
     if(!bt_service_init()) {
         FURI_LOG_E(TAG, "Failed to initialize Bluetooth");
         return ret;
     }
 
-    // Allocate app with error handling
-    DocviewApp* app = Docview_app_alloc();
-    if(!app) {
-        FURI_LOG_E(TAG, "Failed to allocate application");
+    FuriMutex* ble_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    if(!ble_mutex) {
+        FURI_LOG_E(TAG, "Failed to allocate BLE mutex");
         bt_service_deinit();
         return ret;
     }
 
-    // Connect GUI with view dispatcher
-    view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
+    do {
+        app = Docview_app_alloc();
+        if(!app) {
+            FURI_LOG_E(TAG, "Failed to allocate application");
+            break;
+        }
 
-    // Run application
-    view_dispatcher_run(app->view_dispatcher);
+        app->ble_state.mutex = ble_mutex;
 
-    // Application cleanup
-    Docview_app_free(app);
+        if(!docview_init_views(app)) {
+            FURI_LOG_E(TAG, "Failed to initialize views");
+            break;
+        }
 
-    return 0;
+        app->ble_state.status = BleTransferStatusIdle;
+        app->ble_state.transfer_active = false;
+        app->ble_state.thread = NULL;
+        app->ble_state.timeout_timer = NULL;
+        app->ble_state.file_path = furi_string_alloc();
+        if(!app->ble_state.file_path) {
+            FURI_LOG_E(TAG, "Failed to allocate file path string");
+            break;
+        }
+
+        bt_service_subscribe_status(docview_ble_status_changed_callback, app);
+
+        if(!view_dispatcher_attach_to_gui(
+               app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen)) {
+            FURI_LOG_E(TAG, "Failed to attach view dispatcher");
+            break;
+        }
+
+        view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewSubmenu);
+
+        view_dispatcher_run(app->view_dispatcher);
+        ret = 0;
+
+    } while(0);
+
+    // Safely cleanup resources
+    if(app) {
+        Docview_app_free(app);
+    } else {
+        // Only free these resources if app allocation failed but we allocated them
+        furi_mutex_free(ble_mutex);
+        bt_service_deinit();
+    }
+
+    return ret;
 }

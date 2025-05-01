@@ -23,11 +23,13 @@ bool bt_service_init(void) {
 
     bool success = false;
     if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
-        bt_init();
-        if(bt_is_active()) {
-            status_callback = NULL;
-            status_context = NULL;
-            success = true;
+        if(furi_hal_bt_is_alive() && furi_record_exists("bt")) {
+            bt_init();
+            if(bt_is_active()) {
+                status_callback = NULL;
+                status_context = NULL;
+                success = true;
+            }
         }
         furi_mutex_release(bt_mutex);
     }
@@ -43,15 +45,16 @@ bool bt_service_init(void) {
 void bt_service_deinit(void) {
     furi_assert(bt_mutex);
 
-    // Ensure no active transfers
+    // Stop any active file transfers first
     ble_file_service_deinit();
 
+    // Clean up BT status callback
     if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
         if(status_callback) {
             status_callback(BtStatusOff, status_context);
-            status_callback = NULL;
-            status_context = NULL;
         }
+        status_callback = NULL;
+        status_context = NULL;
         furi_mutex_release(bt_mutex);
     }
 
@@ -60,8 +63,7 @@ void bt_service_deinit(void) {
     bt_mutex = NULL;
 }
 
-void bt_service_subscribe_status(void* bt, BtEventCallback callback, void* context) {
-    UNUSED(bt);
+void bt_service_subscribe_status(BtEventCallback callback, void* context) {
     if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
         status_callback = callback;
         status_context = context;
@@ -77,8 +79,7 @@ void bt_service_subscribe_status(void* bt, BtEventCallback callback, void* conte
     }
 }
 
-void bt_service_unsubscribe_status(void* bt) {
-    UNUSED(bt);
+void bt_service_unsubscribe_status(void) {
     if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
         status_callback = NULL;
         status_context = NULL;
