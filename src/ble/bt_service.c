@@ -1,10 +1,12 @@
 #include "bt_service.h"
-#include "bt_hal_compat.h"
-#include "../docview.h"
-#include <furi_hal.h>
+#include <furi.h> // Include furi first
+#include <furi_hal.h> // Then include general HAL
+#include <furi_hal_bt.h> // Then include specific BT HAL
+#include <furi_hal_resources.h> // Include resources definitions
 #include <stdint.h>
 #include <string.h>
-#include <furi.h> // Include furi for logging
+#include "bt_hal_compat.h" // Include our compatibility layer
+#include "furi_hal_bt_custom.h" // Include our custom BT declarations
 
 #define TAG "BtService" // Define TAG for logging
 
@@ -12,11 +14,47 @@
 #define FILE_CONTROL_END   0x02
 #define FILE_CONTROL_ERROR 0xFF
 
-#define MAX_BLE_PACKET_SIZE 20
-
 static BtEventCallback status_callback = NULL;
 static void* status_context = NULL;
 static FuriMutex* bt_mutex = NULL;
+static BtStatus current_bt_status = BtStatusOff; // Track internal status
+static FuriHalBtStatusCallback hal_callback_handle = NULL;
+
+// Internal HAL status callback
+static void bt_hal_status_callback(FuriHalBtStatus status, void* context) {
+    UNUSED(context);
+    BtStatus new_status = BtStatusOff; // Default
+
+    // Map HAL status to our internal enum
+    switch(status) {
+    case FuriHalBtStatusIdle:
+        // Consider Idle as Off unless explicitly advertising/connected
+        new_status = BtStatusOff;
+        break;
+    case FuriHalBtStatusAdvertising:
+        new_status = BtStatusAdvertising;
+        break;
+    case FuriHalBtStatusConnected:
+        new_status = BtStatusConnected;
+        break;
+    default:
+        new_status = BtStatusOff;
+        break;
+    }
+
+    // Update status and notify subscriber if changed
+    if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
+        if(current_bt_status != new_status) {
+            FURI_LOG_I(TAG, "BT HAL Status Changed: %d -> %d", current_bt_status, new_status);
+            current_bt_status = new_status;
+            if(status_callback) {
+                // Run user callback outside mutex if possible, or ensure it's quick
+                status_callback(current_bt_status, status_context);
+            }
+        }
+        furi_mutex_release(bt_mutex);
+    }
+}
 
 bool bt_service_init(void) {
     if(bt_mutex) return true; // Already initialized
@@ -29,17 +67,24 @@ bool bt_service_init(void) {
 
     bool success = false;
     if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
-        // Check if BT stack is running and record exists
-        if(furi_hal_bt_is_alive() && furi_record_exists(RECORD_BT)) {
-            // Attempt to initialize BT HAL compatibility layer
-            bt_init(); // This might turn on the BT chip if not already on
-            if(bt_is_active()) {
+        // Check if BT stack is running and the "bt" record exists
+        if(furi_hal_bt_is_alive() && furi_record_exists(RECORD_BT)) { // Use RECORD_BT
+            if(furi_hal_bt_is_active()) {
                 status_callback = NULL;
                 status_context = NULL;
+                current_bt_status = BtStatusOff; // Initial state
+
+                // Register HAL status callback
+                hal_callback_handle =
+                    furi_hal_bt_set_status_changed_callback(bt_hal_status_callback, NULL);
+
+                // Update initial status based on HAL
+                bt_hal_status_callback(furi_hal_bt_get_status(), NULL);
+
                 success = true;
                 FURI_LOG_I(TAG, "BT Service Initialized");
             } else {
-                FURI_LOG_W(TAG, "BT HAL init failed or BT is not active");
+                FURI_LOG_W(TAG, "BT is not active");
             }
         } else {
             FURI_LOG_W(TAG, "BT stack not alive or BT record missing");
@@ -64,14 +109,17 @@ void bt_service_deinit(void) {
     // Stop any active file transfers first (acquire mutex inside)
     ble_file_service_deinit();
 
+    // Unregister HAL callback
+    if(hal_callback_handle) {
+        furi_hal_bt_set_status_changed_callback(NULL, NULL);
+        hal_callback_handle = NULL;
+    }
+
     // Clean up BT status callback
     if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
-        if(status_callback) {
-            // Optionally notify subscriber that BT is turning off
-            // status_callback(BtStatusOff, status_context);
-        }
         status_callback = NULL;
         status_context = NULL;
+        current_bt_status = BtStatusOff;
         furi_mutex_release(bt_mutex);
     }
 
@@ -92,13 +140,7 @@ void bt_service_subscribe_status(BtEventCallback callback, void* context) {
 
         if(callback) {
             // Immediately report current status
-            if(bt_is_active()) {
-                // Assuming Advertising is the default state when active and not connected
-                // More sophisticated state tracking might be needed depending on requirements
-                callback(BtStatusAdvertising, context);
-            } else {
-                callback(BtStatusOff, context);
-            }
+            callback(current_bt_status, context);
         }
         furi_mutex_release(bt_mutex);
     }
@@ -140,8 +182,18 @@ bool ble_file_service_send(uint8_t* data, size_t size) {
 
     bool success = false;
     if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
-        if(!bt_is_active()) {
-            FURI_LOG_W(TAG, "Send failed: BT not active");
+        // Check status inside the loop as well
+        if(current_bt_status != BtStatusConnected) {
+            FURI_LOG_W(TAG, "Send failed: BT not connected");
+            furi_mutex_release(bt_mutex);
+            return false;
+        }
+
+        // Get max packet size dynamically
+        uint16_t max_ble_packet_size = bt_get_max_packet_size();
+        if(max_ble_packet_size == 0) {
+            // Handle error case where packet size is zero (e.g., BT not ready)
+            FURI_LOG_E(TAG, "Send failed: Invalid max packet size (0)");
             furi_mutex_release(bt_mutex);
             return false;
         }
@@ -151,29 +203,37 @@ bool ble_file_service_send(uint8_t* data, size_t size) {
         success = true; // Assume success unless a chunk fails
 
         while(remaining > 0) {
-            size_t chunk_size = remaining > MAX_BLE_PACKET_SIZE ? MAX_BLE_PACKET_SIZE : remaining;
+            // Re-check status inside the loop
+            if(current_bt_status != BtStatusConnected) {
+                FURI_LOG_W(TAG, "Send failed: BT disconnected during transfer");
+                success = false;
+                break;
+            }
+
+            size_t chunk_size = remaining > max_ble_packet_size ? max_ble_packet_size : remaining;
             bool sent_success = false;
             // Retry sending a chunk a few times
             for(uint8_t attempts = 0; attempts < 3 && !sent_success; attempts++) {
-                // Re-check bt_is_active() in case it disconnected during transfer
-                if(!bt_is_active()) {
-                    FURI_LOG_W(TAG, "Send failed: BT disconnected during transfer");
+                // Re-check status before each attempt
+                if(current_bt_status != BtStatusConnected) {
+                    FURI_LOG_W(TAG, "Send attempt failed: BT disconnected");
                     success = false;
-                    break;
+                    break; // Break retry loop
                 }
 
                 // Use a temporary buffer on stack or ensure bt_serial_tx handles const data
-                uint8_t tx_buffer[MAX_BLE_PACKET_SIZE];
-                memcpy(tx_buffer, data + offset, chunk_size);
-                int32_t sent = bt_serial_tx(tx_buffer, (uint16_t)chunk_size);
+                // bt_serial_tx takes const uint8_t*, so direct pointer is fine
+                int32_t sent = bt_serial_tx(data + offset, (uint16_t)chunk_size);
 
                 if(sent == (int32_t)chunk_size) {
                     sent_success = true;
                 } else {
-                    FURI_LOG_W(TAG, "Chunk send failed, attempt %d", attempts + 1);
-                    furi_delay_ms(10); // Small delay before retry
+                    FURI_LOG_W(TAG, "Chunk send failed (ret %ld), attempt %d", sent, attempts + 1);
+                    furi_delay_ms(20); // Increase delay slightly before retry
                 }
             }
+
+            if(!success) break; // Break while loop if BT disconnected during retries
 
             if(!sent_success) {
                 FURI_LOG_E(TAG, "Failed to send chunk after retries");
@@ -185,7 +245,7 @@ bool ble_file_service_send(uint8_t* data, size_t size) {
             remaining -= chunk_size;
             // Add a small delay between packets to avoid overwhelming the receiver
             // This value might need tuning
-            furi_delay_ms(5);
+            furi_delay_ms(10); // Keep a small delay
         }
         furi_mutex_release(bt_mutex);
     } else {
@@ -199,13 +259,23 @@ bool ble_file_service_start_transfer(const char* file_name, uint32_t file_size) 
 
     bool success = false;
     if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
-        if(!bt_is_active()) {
-            FURI_LOG_W(TAG, "Start transfer failed: BT not active");
+        // Check if connected before starting
+        if(current_bt_status != BtStatusConnected) {
+            FURI_LOG_W(TAG, "Start transfer failed: BT not connected");
             furi_mutex_release(bt_mutex);
             return false;
         }
 
-        uint8_t start_packet[MAX_BLE_PACKET_SIZE]; // Use max size for safety
+        // Get max packet size for buffer allocation, ensure it's large enough for header
+        uint16_t max_packet_size = bt_get_max_packet_size();
+        if(max_packet_size < 64) { // Need space for control, size, and some name
+            FURI_LOG_E(
+                TAG, "Start transfer failed: Max packet size too small (%d)", max_packet_size);
+            furi_mutex_release(bt_mutex);
+            return false;
+        }
+
+        uint8_t start_packet[max_packet_size]; // Use dynamic size
         memset(start_packet, 0, sizeof(start_packet)); // Clear the buffer
 
         start_packet[0] = FILE_CONTROL_START;
@@ -217,8 +287,8 @@ bool ble_file_service_start_transfer(const char* file_name, uint32_t file_size) 
 
         // Pack file name, ensuring null termination within buffer limits if possible
         size_t name_len = strlen(file_name);
-        size_t max_name_len = sizeof(start_packet) - 5 -
-                              1; // Reserve space for control byte, size, and null terminator
+        // Calculate max name length based on actual max_packet_size
+        size_t max_name_len = max_packet_size - 5 - 1;
         if(name_len > max_name_len) {
             name_len = max_name_len;
             FURI_LOG_W(TAG, "Filename truncated for BLE transfer");
@@ -232,7 +302,7 @@ bool ble_file_service_start_transfer(const char* file_name, uint32_t file_size) 
         success = (sent == (int32_t)packet_len);
 
         if(!success) {
-            FURI_LOG_E(TAG, "Failed to send start transfer packet");
+            FURI_LOG_E(TAG, "Failed to send start transfer packet (ret %ld)", sent);
         }
 
         furi_mutex_release(bt_mutex);
@@ -247,8 +317,9 @@ bool ble_file_service_end_transfer(void) {
 
     bool success = false;
     if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
-        if(!bt_is_active()) {
-            // Don't log error here, might be normal if disconnected
+        // Check if connected before sending end packet
+        if(current_bt_status != BtStatusConnected) {
+            // Don't log error here, might be normal if disconnected just before this call
             furi_mutex_release(bt_mutex);
             return false;
         }
@@ -256,7 +327,7 @@ bool ble_file_service_end_transfer(void) {
         int32_t sent = bt_serial_tx(end_packet, 1);
         success = (sent == 1);
         if(!success) {
-            FURI_LOG_E(TAG, "Failed to send end transfer packet");
+            FURI_LOG_E(TAG, "Failed to send end transfer packet (ret %ld)", sent);
         }
         furi_mutex_release(bt_mutex);
     } else {
@@ -268,9 +339,9 @@ bool ble_file_service_end_transfer(void) {
 void ble_file_service_deinit(void) {
     if(!bt_mutex) return; // Not initialized
 
-    // Send error packet only if BT is currently active
+    // Send error packet only if BT is currently connected
     if(furi_mutex_acquire(bt_mutex, FuriWaitForever) == FuriStatusOk) {
-        if(bt_is_active()) {
+        if(current_bt_status == BtStatusConnected) {
             uint8_t error_packet[1] = {FILE_CONTROL_ERROR};
             // Best effort send, ignore result
             bt_serial_tx(error_packet, 1);

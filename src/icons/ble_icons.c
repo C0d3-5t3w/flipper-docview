@@ -43,6 +43,3 @@ const Icon I_Loading_10x10 = {
     .frame_rate = 0,
     .frames = I_Loading_10x10_frames,
 };
-
-extern const Icon I_Ok_15x15;
-extern const Icon I_Error_15x15;

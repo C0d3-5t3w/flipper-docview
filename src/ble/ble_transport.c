@@ -23,17 +23,23 @@ bool ble_transport_tx(const uint8_t* data, size_t size) {
         return false;
     }
 
+    // Get dynamic max packet size
     uint16_t max_packet_size = bt_get_max_packet_size();
+    if(max_packet_size == 0) {
+        FURI_LOG_E(TAG, "TX failed: Invalid max packet size (0)");
+        return false;
+    }
+
     if(size > max_packet_size) {
         FURI_LOG_E(
-            TAG, "TX failed: Data size (%d) exceeds max packet size (%d)", size, max_packet_size);
+            TAG, "TX failed: Data size (%zu) exceeds max packet size (%u)", size, max_packet_size);
         return false; // Prevent sending oversized packets
     }
 
     // The bt_hal_compat layer handles the buffer, just call tx
     int32_t sent = bt_serial_tx(data, (uint16_t)size);
     if(sent != (int32_t)size) {
-        FURI_LOG_W(TAG, "TX failed: bt_serial_tx returned %ld, expected %d", sent, size);
+        FURI_LOG_W(TAG, "TX failed: bt_serial_tx returned %ld, expected %zu", sent, size);
         return false;
     }
 

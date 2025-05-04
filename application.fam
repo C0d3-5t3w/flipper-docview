@@ -5,27 +5,36 @@ App(
     name="Document Viewer",  # Displayed in menus
     apptype=FlipperAppType.EXTERNAL,
     entry_point="main_Docview_app",
-    stack_size=2 * 1024,
+    stack_size=3 * 1024,  # Increased stack size for BLE thread + file ops
     fap_category="Tools",
     # Optional values
-    fap_version="0.1",
+    fap_version="0.3",  # Incremented version
     fap_icon="docview.png",  # 10x10 1-bit PNG
-    fap_description="View text content and share via BLE from multiple file types (BLE sharing requires compatible firmware)",
+    fap_description="View text content and share via BLE from multiple file types",
     fap_author="C0d3-5t3w",
     fap_weburl="https://github.com/C0d3-5t3w/flipper-docview",
     fap_icon_assets="images",  # Image assets to compile for this application
-    
+
     # Include all required source files
     sources=[
-        "src/docview.c", 
+        "src/docview.c",
         "src/ble/bt_service.c",
-        "src/ble/ble_transport.c",
+        "src/ble/furi_hal_bt_custom.h", # Add our new header
+        "src/icons/docview_icons.c",  
         "src/icons/ble_icons.c",
         "src/files/file_browser_utils.c",
         "src/files/file_browser.c",
     ],
-    
+
     # Link against required SDK modules - the firmware will provide these libraries
-    requires=["furi", "hal", "gui", "storage", "dialogs", "notification",],
-    
+    requires=[
+        "furi", 
+        "furi_hal",
+        "gui",
+        "storage",
+        "dialogs",
+        "notification",
+        "bt", # Explicitly require the bt library
+        "furi_hal_bt", # Explicitly require the furi_hal_bt library
+    ],
 )
