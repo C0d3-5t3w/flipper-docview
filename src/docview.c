@@ -10,8 +10,8 @@
 #include <gui/modules/variable_item_list.h>
 #include <gui/modules/popup.h>
 #include <gui/modules/file_browser.h>
-#include <notification.h>
-#include <notification_messages.h>
+#include <notification/notification.h>
+#include <notification/notification_messages.h>
 #include <storage/storage.h>
 #include <dialogs/dialogs.h>
 #include <toolbox/path.h>

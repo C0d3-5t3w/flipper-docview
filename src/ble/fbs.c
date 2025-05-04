@@ -1,5 +1,5 @@
 #include "fbs.h"
-#include <ble_profile/ble_profile_serial.h> // correct path under lib/ble_profile
+#include <ble_profile_serial.h> // correct SDK header under lib/ble_profile
 #include <storage/storage.h>
 #include <stdio.h>
 
