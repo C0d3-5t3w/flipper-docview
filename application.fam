@@ -26,5 +26,6 @@ App(
     ],
     
     # Link against required SDK modules - the firmware will provide these libraries
-    fap_libs=["file_browser", "storage"],
+    requires=["furi", "hal", "gui", "storage", "dialogs", "notification",],
+    
 )

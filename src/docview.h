@@ -74,7 +74,6 @@ typedef struct {
     FuriString* file_path;
     FuriTimer* timeout_timer;
     FuriThread* thread;
-    FuriMutex* mutex;  // Add mutex for BLE state protection 
     bool transfer_active;
 } BleTransferState;
 
@@ -85,6 +84,7 @@ typedef struct DocviewApp {
     ViewDispatcher* view_dispatcher;
 
     // BLE state
+    bool bt_initialized; // Flag to track if BT service initialized successfully
     BleTransferState ble_state;
     
     // Rest of the struct members
