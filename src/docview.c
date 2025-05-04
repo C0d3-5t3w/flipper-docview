@@ -1,6 +1,5 @@
 #include <furi.h>
 #include <furi_hal.h>
-#include <furi_hal_bt.h> // Include BT HAL early
 #include <furi_hal_resources.h>
 #include <gui/gui.h>
 #include <gui/view.h>
@@ -11,18 +10,17 @@
 #include <gui/modules/variable_item_list.h>
 #include <gui/modules/popup.h>
 #include <gui/modules/file_browser.h>
-#include <notification/notification.h>
-#include <notification/notification_messages.h>
+#include <notification.h>
+#include <notification_messages.h>
 #include <storage/storage.h>
 #include <dialogs/dialogs.h>
 #include <toolbox/path.h>
 #include <string.h>
 
 #include "docview.h"
-#include "ble/bt_service.h"
 #include "files/file_browser.h"
 #include "icons/docview_icons.h"
-#include "ble/furi_hal_bt_custom.h" // Use our custom header after system ones
+#include "ble/fbs.h"
 
 #define TAG "Docview"
 
@@ -403,12 +401,6 @@ static bool Docview_view_reader_input_callback(InputEvent* event, void* context)
         }
     } else if(event->type == InputTypeLong) {
         if(event->key == InputKeyOk) {
-            if(!app->bt_initialized) {
-                notification_message(app->notifications, &sequence_error);
-                FURI_LOG_W(TAG, "BLE transfer requested but BT not initialized");
-                return true;
-            }
-
             bool document_loaded = false;
             with_view_model(
                 app->view_reader,
@@ -441,8 +433,7 @@ static bool Docview_view_reader_input_callback(InputEvent* event, void* context)
                     },
                     false);
 
-                view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewBleTransfer);
-                docview_ble_transfer_start(app);
+                notification_message(app->notifications, &sequence_ok);
             } else {
                 notification_message(app->notifications, &sequence_error);
             }
@@ -451,464 +442,6 @@ static bool Docview_view_reader_input_callback(InputEvent* event, void* context)
     }
 
     return false;
-}
-
-int32_t docview_ble_transfer_process_callback(void* context) {
-    DocviewApp* app = context;
-    furi_assert(app);
-    furi_assert(app->mutex);
-
-    if(furi_mutex_acquire(app->mutex, FuriWaitForever) != FuriStatusOk) {
-        FURI_LOG_E(TAG, "BLE Thread: Failed to acquire mutex");
-        return -1;
-    }
-
-    if(!app->bt_initialized) {
-        FURI_LOG_E(TAG, "BLE Transfer Thread: BT not initialized");
-        app->ble_state.status = BleTransferStatusFailed;
-        docview_ble_transfer_update_status(app);
-        furi_mutex_release(app->mutex);
-        return -1;
-    }
-
-    char local_file_path[256];
-    strlcpy(
-        local_file_path, furi_string_get_cstr(app->ble_state.file_path), sizeof(local_file_path));
-    char local_file_name[sizeof(app->ble_state.file_name)];
-    strlcpy(local_file_name, app->ble_state.file_name, sizeof(local_file_name));
-
-    furi_mutex_release(app->mutex);
-
-    Storage* storage = furi_record_open(RECORD_STORAGE);
-    File* file = storage_file_alloc(storage);
-    uint8_t* buffer = malloc(BLE_CHUNK_SIZE);
-    bool success = false;
-    bool start_sent = false;
-    uint32_t file_size = 0;
-    uint32_t bytes_sent = 0;
-    uint16_t chunks_sent = 0;
-    uint16_t total_chunks = 0;
-
-    if(!buffer) {
-        FURI_LOG_E(TAG, "Failed to allocate transfer buffer");
-        furi_mutex_acquire(app->mutex, FuriWaitForever);
-        app->ble_state.status = BleTransferStatusFailed;
-        docview_ble_transfer_update_status(app);
-        furi_mutex_release(app->mutex);
-        storage_file_free(file);
-        furi_record_close(RECORD_STORAGE);
-        return -1;
-    }
-
-    do {
-        if(strlen(local_file_path) == 0) {
-            FURI_LOG_E(TAG, "Invalid file path for transfer");
-            break;
-        }
-
-        if(!storage_file_open(file, local_file_path, FSAM_READ, FSOM_OPEN_EXISTING)) {
-            FURI_LOG_E(TAG, "Failed to open file: %s", local_file_path);
-            break;
-        }
-
-        FileInfo file_info;
-        if(storage_common_stat(storage, local_file_path, &file_info) != FSE_OK) {
-            FURI_LOG_E(TAG, "Failed to get file size for: %s", local_file_path);
-            storage_file_close(file);
-            break;
-        }
-        file_size = file_info.size;
-        total_chunks = (file_size + BLE_CHUNK_SIZE - 1) / BLE_CHUNK_SIZE;
-
-        FURI_LOG_I(TAG, "Starting BLE transfer: %s, Size: %lu bytes", local_file_name, file_size);
-
-        furi_mutex_acquire(app->mutex, FuriWaitForever);
-        app->ble_state.file_size = file_size;
-        app->ble_state.bytes_sent = 0;
-        app->ble_state.chunks_sent = 0;
-        app->ble_state.total_chunks = total_chunks;
-
-        while(app->ble_state.status != BleTransferStatusConnected) {
-            uint32_t flags = furi_thread_flags_get();
-            if(flags & BLE_THREAD_FLAG_STOP || app->ble_state.status == BleTransferStatusFailed) {
-                FURI_LOG_I(TAG, "Transfer stopped/failed before connection established.");
-                furi_mutex_release(app->mutex);
-                storage_file_close(file);
-                success = false;
-                goto cleanup;
-            }
-            furi_mutex_release(app->mutex);
-            furi_delay_ms(100);
-            furi_mutex_acquire(app->mutex, FuriWaitForever);
-        }
-
-        furi_mutex_release(app->mutex);
-
-        if(!ble_file_service_start_transfer(local_file_name, file_size)) {
-            FURI_LOG_E(TAG, "Failed to send start transfer packet");
-            furi_mutex_acquire(app->mutex, FuriWaitForever);
-            app->ble_state.status = BleTransferStatusFailed;
-            docview_ble_transfer_update_status(app);
-            furi_mutex_release(app->mutex);
-            storage_file_close(file);
-            break;
-        }
-        start_sent = true;
-
-        furi_mutex_acquire(app->mutex, FuriWaitForever);
-        app->ble_state.status = BleTransferStatusTransferring;
-        docview_ble_transfer_update_status(app);
-        furi_mutex_release(app->mutex);
-
-        success = true;
-        while(bytes_sent < file_size) {
-            uint32_t flags = furi_thread_flags_get();
-            if(flags & BLE_THREAD_FLAG_STOP) {
-                FURI_LOG_I(TAG, "Transfer stopped by request flag");
-                success = false;
-                break;
-            }
-
-            furi_mutex_acquire(app->mutex, FuriWaitForever);
-            BleTransferStatus current_status = app->ble_state.status;
-            furi_mutex_release(app->mutex);
-
-            if(current_status != BleTransferStatusTransferring) {
-                FURI_LOG_W(TAG, "Transfer interrupted (status: %d)", current_status);
-                success = false;
-                break;
-            }
-
-            size_t bytes_to_read = file_size - bytes_sent;
-            if(bytes_to_read > BLE_CHUNK_SIZE) {
-                bytes_to_read = BLE_CHUNK_SIZE;
-            }
-
-            size_t bytes_read = storage_file_read(file, buffer, bytes_to_read);
-            if(bytes_read == 0) {
-                if(storage_file_eof(file)) {
-                    FURI_LOG_W(TAG, "EOF reached unexpectedly before sending all bytes");
-                } else {
-                    FURI_LOG_E(TAG, "File read error during transfer");
-                }
-                success = false;
-                break;
-            }
-
-            if(!ble_file_service_send(buffer, bytes_read)) {
-                FURI_LOG_E(TAG, "Failed to send data chunk via BLE");
-                success = false;
-                furi_mutex_acquire(app->mutex, FuriWaitForever);
-                app->ble_state.status = BleTransferStatusFailed;
-                docview_ble_transfer_update_status(app);
-                furi_mutex_release(app->mutex);
-                break;
-            }
-
-            bytes_sent += bytes_read;
-            chunks_sent++;
-
-            furi_mutex_acquire(app->mutex, FuriWaitForever);
-            app->ble_state.bytes_sent = bytes_sent;
-            app->ble_state.chunks_sent = chunks_sent;
-            docview_ble_transfer_update_status(app);
-            furi_mutex_release(app->mutex);
-        }
-
-        if(success && bytes_sent == file_size) {
-            if(start_sent) {
-                success = ble_file_service_end_transfer();
-                FURI_LOG_I(TAG, "BLE transfer end packet sent: %s", success ? "OK" : "FAIL");
-            } else {
-                success = false;
-            }
-        } else {
-            success = false;
-            FURI_LOG_W(TAG, "Transfer loop exited. Sent: %lu / %lu", bytes_sent, file_size);
-            furi_mutex_acquire(app->mutex, FuriWaitForever);
-            if(app->ble_state.status != BleTransferStatusFailed) {
-                app->ble_state.status = BleTransferStatusFailed;
-                docview_ble_transfer_update_status(app);
-            }
-            furi_mutex_release(app->mutex);
-        }
-
-    } while(0);
-
-cleanup:
-    if(storage_file_is_open(file)) {
-        storage_file_close(file);
-    }
-    storage_file_free(file);
-    furi_record_close(RECORD_STORAGE);
-    free(buffer);
-
-    furi_mutex_acquire(app->mutex, FuriWaitForever);
-    if(success && app->ble_state.status != BleTransferStatusFailed) {
-        app->ble_state.status = BleTransferStatusComplete;
-    } else {
-        app->ble_state.status = BleTransferStatusFailed;
-    }
-    docview_ble_transfer_update_status(app);
-    furi_mutex_release(app->mutex);
-
-    return (app->ble_state.status == BleTransferStatusComplete) ? 0 : -1;
-}
-
-void docview_ble_transfer_update_status(DocviewApp* app) {
-    furi_assert(app);
-    furi_assert(app->popup_ble);
-
-    popup_reset(app->popup_ble);
-    popup_set_context(app->popup_ble, app);
-
-    switch(app->ble_state.status) {
-    case BleTransferStatusIdle:
-        popup_set_header(app->popup_ble, "BLE File Transfer", 64, 2, AlignCenter, AlignTop);
-        popup_set_text(app->popup_ble, "Ready", 64, 32, AlignCenter, AlignTop);
-        popup_set_icon(app->popup_ble, 3, 12, &I_BleWaitConnecting_15x15);
-        popup_set_callback(app->popup_ble, docview_navigation_submenu_void_callback);
-        popup_set_timeout(app->popup_ble, 0);
-        break;
-
-    case BleTransferStatusAdvertising:
-        popup_set_header(app->popup_ble, "BLE File Transfer", 64, 2, AlignCenter, AlignTop);
-        popup_set_text(app->popup_ble, "Waiting for connection...", 64, 32, AlignCenter, AlignTop);
-        popup_set_icon(app->popup_ble, 3, 12, &I_BleWaitConnecting_15x15);
-        popup_set_callback(app->popup_ble, docview_navigation_submenu_void_callback);
-        popup_set_timeout(app->popup_ble, 0);
-        break;
-
-    case BleTransferStatusConnected:
-        popup_set_header(app->popup_ble, "BLE File Transfer", 64, 2, AlignCenter, AlignTop);
-        popup_set_text(
-            app->popup_ble, "Connected\nStarting transfer...", 64, 32, AlignCenter, AlignTop);
-        popup_set_icon(app->popup_ble, 3, 12, &I_BleConnected_15x15);
-        popup_set_callback(app->popup_ble, docview_navigation_submenu_void_callback);
-        popup_set_timeout(app->popup_ble, 0);
-        break;
-
-    case BleTransferStatusTransferring: {
-        char progress_str[48];
-        float progress = 0.0f;
-        if(app->ble_state.file_size > 0) {
-            progress = (float)app->ble_state.bytes_sent / (float)app->ble_state.file_size * 100.0f;
-        }
-        if(app->ble_state.file_size >= 1024) {
-            snprintf(
-                progress_str,
-                sizeof(progress_str),
-                "%.1f%% (%lu/%lu KB)",
-                (double)progress,
-                (unsigned long)app->ble_state.bytes_sent / 1024,
-                (unsigned long)(app->ble_state.file_size + 1023) / 1024);
-        } else {
-            snprintf(
-                progress_str,
-                sizeof(progress_str),
-                "%.1f%% (%lu/%lu B)",
-                (double)progress,
-                (unsigned long)app->ble_state.bytes_sent,
-                (unsigned long)app->ble_state.file_size);
-        }
-
-        popup_set_header(app->popup_ble, "Sending File...", 64, 2, AlignCenter, AlignTop);
-        popup_set_text(app->popup_ble, progress_str, 64, 25, AlignCenter, AlignTop);
-        popup_set_icon(app->popup_ble, 3, 12, &I_BleConnected_15x15);
-
-        char file_info[64];
-        snprintf(
-            file_info,
-            sizeof(file_info),
-            "%.*s",
-            (int)(sizeof(file_info) - 1),
-            app->ble_state.file_name);
-        popup_set_text(app->popup_ble, file_info, 64, 42, AlignCenter, AlignTop);
-        popup_set_callback(app->popup_ble, docview_navigation_submenu_void_callback);
-        popup_set_timeout(app->popup_ble, 0);
-        break;
-    }
-
-    case BleTransferStatusComplete:
-        popup_set_header(app->popup_ble, "Transfer Complete", 64, 2, AlignCenter, AlignTop);
-        popup_set_text(app->popup_ble, "File sent successfully", 64, 32, AlignCenter, AlignTop);
-        popup_set_icon(app->popup_ble, 3, 12, &I_Ok);
-        popup_set_callback(app->popup_ble, docview_navigation_submenu_void_callback);
-        popup_set_context(app->popup_ble, app);
-        popup_set_timeout(app->popup_ble, 3000);
-        break;
-
-    case BleTransferStatusFailed:
-        popup_set_header(app->popup_ble, "Transfer Failed", 64, 2, AlignCenter, AlignTop);
-        popup_set_text(app->popup_ble, "Error sending file", 64, 32, AlignCenter, AlignTop);
-        popup_set_icon(app->popup_ble, 3, 12, &I_Error);
-        popup_set_callback(app->popup_ble, docview_navigation_submenu_void_callback);
-        popup_set_context(app->popup_ble, app);
-        popup_set_timeout(app->popup_ble, 3000);
-        break;
-    }
-}
-
-void docview_ble_timeout_callback(void* context) {
-    DocviewApp* app = context;
-    furi_assert(app);
-    furi_assert(app->mutex);
-
-    if(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk) {
-        if(app->ble_state.status == BleTransferStatusAdvertising ||
-           app->ble_state.status == BleTransferStatusConnected ||
-           app->ble_state.status == BleTransferStatusTransferring) {
-            FURI_LOG_W(TAG, "BLE Transfer timed out (Status: %d)", app->ble_state.status);
-            docview_ble_transfer_stop(app);
-            app->ble_state.status = BleTransferStatusFailed;
-            docview_ble_transfer_update_status(app);
-        }
-        furi_mutex_release(app->mutex);
-    }
-}
-
-void docview_ble_transfer_start(DocviewApp* app) {
-    furi_assert(app);
-    furi_assert(app->mutex);
-
-    if(furi_mutex_acquire(app->mutex, FuriWaitForever) != FuriStatusOk) {
-        FURI_LOG_E(TAG, "Start Transfer: Failed to acquire mutex");
-        return;
-    }
-
-    if(!app->bt_initialized) {
-        FURI_LOG_E(TAG, "Cannot start BLE transfer: BT not initialized");
-        notification_message(app->notifications, &sequence_error);
-        furi_mutex_release(app->mutex);
-        return;
-    }
-
-    if(app->ble_state.transfer_active) {
-        FURI_LOG_W(TAG, "Transfer already active");
-        furi_mutex_release(app->mutex);
-        return;
-    }
-
-    if(!app->ble_state.file_path || furi_string_empty(app->ble_state.file_path)) {
-        FURI_LOG_E(TAG, "Cannot start BLE transfer: No file selected");
-        notification_message(app->notifications, &sequence_error);
-        furi_mutex_release(app->mutex);
-        return;
-    }
-
-    app->ble_state.status = BleTransferStatusAdvertising;
-    app->ble_state.bytes_sent = 0;
-    app->ble_state.chunks_sent = 0;
-    app->ble_state.file_size = 0;
-    app->ble_state.total_chunks = 0;
-    app->ble_state.transfer_active = true;
-
-    if(!ble_file_service_init()) {
-        FURI_LOG_E(TAG, "Failed to initialize BLE file service");
-        app->ble_state.status = BleTransferStatusFailed;
-        app->ble_state.transfer_active = false;
-        docview_ble_transfer_update_status(app);
-        furi_mutex_release(app->mutex);
-        return;
-    }
-
-    if(app->ble_state.timeout_timer) {
-        furi_timer_stop(app->ble_state.timeout_timer);
-    } else {
-        app->ble_state.timeout_timer =
-            furi_timer_alloc(docview_ble_timeout_callback, FuriTimerTypeOnce, app);
-    }
-
-    if(app->ble_state.timeout_timer) {
-        furi_timer_start(app->ble_state.timeout_timer, furi_ms_to_ticks(BLE_TRANSFER_TIMEOUT));
-    } else {
-        FURI_LOG_E(TAG, "Failed to allocate/start timeout timer");
-        app->ble_state.status = BleTransferStatusFailed;
-        app->ble_state.transfer_active = false;
-        docview_ble_transfer_update_status(app);
-        ble_file_service_deinit();
-        furi_mutex_release(app->mutex);
-        return;
-    }
-
-    docview_ble_transfer_update_status(app);
-
-    if(app->ble_state.thread) {
-        FURI_LOG_W(TAG, "Existing transfer thread found, attempting to join/free");
-        furi_thread_flags_set(furi_thread_get_id(app->ble_state.thread), BLE_THREAD_FLAG_STOP);
-        furi_thread_join(app->ble_state.thread);
-        furi_thread_free(app->ble_state.thread);
-        app->ble_state.thread = NULL;
-    }
-    app->ble_state.thread = furi_thread_alloc();
-    if(!app->ble_state.thread) {
-        FURI_LOG_E(TAG, "Failed to allocate transfer thread");
-        app->ble_state.status = BleTransferStatusFailed;
-        app->ble_state.transfer_active = false;
-        docview_ble_transfer_update_status(app);
-        if(app->ble_state.timeout_timer) furi_timer_stop(app->ble_state.timeout_timer);
-        ble_file_service_deinit();
-        furi_mutex_release(app->mutex);
-        return;
-    }
-    furi_thread_set_name(app->ble_state.thread, "DocviewBLETransfer");
-    furi_thread_set_stack_size(app->ble_state.thread, 2048);
-    furi_thread_set_callback(app->ble_state.thread, docview_ble_transfer_process_callback);
-    furi_thread_set_context(app->ble_state.thread, app);
-
-    furi_mutex_release(app->mutex);
-
-    furi_thread_start(app->ble_state.thread);
-}
-
-void docview_ble_transfer_stop(DocviewApp* app) {
-    furi_assert(app);
-    furi_assert(app->mutex);
-
-    if(furi_mutex_acquire(app->mutex, FuriWaitForever) != FuriStatusOk) {
-        FURI_LOG_E(TAG, "Stop Transfer: Failed to acquire mutex");
-        return;
-    }
-
-    if(!app->ble_state.transfer_active) {
-        furi_mutex_release(app->mutex);
-        return;
-    }
-
-    FURI_LOG_I(TAG, "Stopping BLE transfer...");
-
-    if(app->ble_state.timeout_timer) {
-        furi_timer_stop(app->ble_state.timeout_timer);
-    }
-
-    if(app->ble_state.thread) {
-        FuriThreadId tid = furi_thread_get_id(app->ble_state.thread);
-        if(tid) {
-            FURI_LOG_D(TAG, "Setting STOP flag for thread %p", tid);
-            furi_thread_flags_set(tid, BLE_THREAD_FLAG_STOP);
-
-            furi_mutex_release(app->mutex);
-            FURI_LOG_D(TAG, "Joining thread %p", tid);
-            furi_thread_join(app->ble_state.thread);
-            FURI_LOG_D(TAG, "Thread %p joined", tid);
-            if(furi_mutex_acquire(app->mutex, FuriWaitForever) != FuriStatusOk) {
-                FURI_LOG_E(TAG, "Stop Transfer: Failed to re-acquire mutex after join");
-                return;
-            }
-        }
-        furi_thread_free(app->ble_state.thread);
-        app->ble_state.thread = NULL;
-    }
-
-    if(app->bt_initialized) {
-        ble_file_service_deinit();
-    }
-
-    app->ble_state.transfer_active = false;
-
-    FURI_LOG_I(TAG, "BLE transfer stopped.");
-
-    furi_mutex_release(app->mutex);
 }
 
 void docview_file_browser_void_callback(void* context) {
@@ -972,38 +505,18 @@ static void docview_submenu_callback(void* context, uint32_t index) {
         view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewFileBrowser);
         break;
 
-    case DocviewSubmenuIndexBleAirdrop:
-        if(!app->bt_initialized) {
-            FURI_LOG_W(TAG, "BLE Airdrop selected but BT not initialized");
+    case DocviewSubmenuIndexBleAirdrop: {
+        DocviewReaderModel* model;
+        with_view_model(app->view_reader, DocviewReaderModel * m, { model = m; }, false);
+        if(!model->is_document_loaded) {
             notification_message(app->notifications, &sequence_error);
-            return;
-        }
-
-        if(app->ble_state.file_path && !furi_string_empty(app->ble_state.file_path)) {
-            view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewBleTransfer);
-            docview_ble_transfer_start(app);
+        } else if(!fbs_init() || !fbs_send_file(model->document_path)) {
+            notification_message(app->notifications, &sequence_error);
         } else {
-            FURI_LOG_I(TAG, "BLE Airdrop: No file selected, opening browser");
-            if(!app->file_browser) {
-                if(!app->ble_state.file_path) {
-                    app->ble_state.file_path = furi_string_alloc_set(DOCUMENTS_FOLDER_PATH);
-                } else {
-                    if(furi_string_empty(app->ble_state.file_path)) {
-                        furi_string_set(app->ble_state.file_path, DOCUMENTS_FOLDER_PATH);
-                    }
-                }
-                app->file_browser = file_browser_alloc(app->ble_state.file_path);
-            }
-
-            file_browser_configure(
-                app->file_browser, DOCUMENT_EXT_FILTER, NULL, true, true, &I_doc, false);
-
-            file_browser_set_callback(app->file_browser, docview_file_browser_void_callback, app);
-
-            file_browser_start(app->file_browser, app->ble_state.file_path);
-            view_dispatcher_switch_to_view(app->view_dispatcher, DocviewViewFileBrowser);
+            notification_message(app->notifications, &sequence_ok);
         }
         break;
+    }
 
     case DocviewSubmenuIndexSettings:
         FURI_LOG_I(TAG, "Settings selected (Not Implemented)");
@@ -1047,16 +560,8 @@ bool docview_init_views(DocviewApp* app) {
     submenu_add_item(
         app->submenu, "Open Document", DocviewSubmenuIndexOpenFile, docview_submenu_callback, app);
 
-    if(app->bt_initialized) {
-        submenu_add_item(
-            app->submenu,
-            "BLE Airdrop",
-            DocviewSubmenuIndexBleAirdrop,
-            docview_submenu_callback,
-            app);
-    } else {
-        FURI_LOG_I(TAG, "BLE Airdrop menu item disabled (BT init failed)");
-    }
+    submenu_add_item(
+        app->submenu, "BLE Airdrop", DocviewSubmenuIndexBleAirdrop, docview_submenu_callback, app);
 
     submenu_add_item(
         app->submenu, "Settings", DocviewSubmenuIndexSettings, docview_submenu_callback, app);
@@ -1069,10 +574,6 @@ bool docview_init_views(DocviewApp* app) {
 
     app->view_reader = docview_reader_view_alloc(app);
     view_dispatcher_add_view(app->view_dispatcher, DocviewViewReader, app->view_reader);
-
-    app->popup_ble = popup_alloc();
-    view_dispatcher_add_view(
-        app->view_dispatcher, DocviewViewBleTransfer, popup_get_view(app->popup_ble));
 
     if(!app->file_browser) {
         if(!app->ble_state.file_path) {
@@ -1093,93 +594,6 @@ bool docview_init_views(DocviewApp* app) {
         app->view_dispatcher, docview_navigation_submenu_callback);
 
     return true;
-}
-
-void docview_ble_status_changed_callback(BtStatus status, void* context) {
-    DocviewApp* app = context;
-    furi_assert(app);
-    furi_assert(app->mutex);
-
-    if(!app->bt_initialized) return;
-
-    if(furi_mutex_acquire(app->mutex, FuriWaitForever) != FuriStatusOk) {
-        FURI_LOG_E(TAG, "BT Status Callback: Failed to acquire mutex");
-        return;
-    }
-
-    FURI_LOG_I(
-        TAG,
-        "BT Status Changed Callback: %d (Current Transfer Status: %d)",
-        status,
-        app->ble_state.status);
-
-    switch(status) {
-    case BtStatusConnected:
-        if(app->ble_state.transfer_active &&
-           app->ble_state.status == BleTransferStatusAdvertising) {
-            app->ble_state.status = BleTransferStatusConnected;
-            if(app->ble_state.timeout_timer) {
-                furi_timer_start(
-                    app->ble_state.timeout_timer, furi_ms_to_ticks(BLE_TRANSFER_TIMEOUT));
-            }
-            docview_ble_transfer_update_status(app);
-        }
-        break;
-    case BtStatusDisconnected:
-        if(app->ble_state.transfer_active &&
-           (app->ble_state.status == BleTransferStatusAdvertising ||
-            app->ble_state.status == BleTransferStatusConnected ||
-            app->ble_state.status == BleTransferStatusTransferring)) {
-            FURI_LOG_W(TAG, "BT Disconnected during active transfer");
-            app->ble_state.status = BleTransferStatusFailed;
-            docview_ble_transfer_update_status(app);
-            bool needs_stop = true;
-
-            if(needs_stop) {
-                furi_mutex_release(app->mutex);
-                docview_ble_transfer_stop(app);
-                return;
-            }
-        }
-        break;
-    case BtStatusAdvertising:
-        if(app->ble_state.transfer_active &&
-           (app->ble_state.status == BleTransferStatusConnected ||
-            app->ble_state.status == BleTransferStatusTransferring)) {
-            FURI_LOG_W(TAG, "BT reverted to Advertising during transfer");
-            app->ble_state.status = BleTransferStatusFailed;
-            docview_ble_transfer_update_status(app);
-            bool needs_stop = true;
-
-            if(needs_stop) {
-                furi_mutex_release(app->mutex);
-                docview_ble_transfer_stop(app);
-                return;
-            }
-        } else if(app->ble_state.transfer_active && app->ble_state.status == BleTransferStatusIdle) {
-            app->ble_state.status = BleTransferStatusAdvertising;
-            docview_ble_transfer_update_status(app);
-        }
-        break;
-    case BtStatusOff:
-        if(app->ble_state.transfer_active && app->ble_state.status != BleTransferStatusIdle &&
-           app->ble_state.status != BleTransferStatusComplete &&
-           app->ble_state.status != BleTransferStatusFailed) {
-            FURI_LOG_W(TAG, "BT turned off during active transfer");
-            app->ble_state.status = BleTransferStatusFailed;
-            docview_ble_transfer_update_status(app);
-            bool needs_stop = true;
-
-            if(needs_stop) {
-                furi_mutex_release(app->mutex);
-                docview_ble_transfer_stop(app);
-                return;
-            }
-        }
-        break;
-    }
-
-    furi_mutex_release(app->mutex);
 }
 
 DocviewApp* Docview_app_alloc(void) {
@@ -1215,30 +629,12 @@ void Docview_app_free(DocviewApp* app) {
     furi_assert(app);
     furi_assert(app->mutex);
 
-    if(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk) {
-        if(app->ble_state.transfer_active) {
-            furi_mutex_release(app->mutex);
-            docview_ble_transfer_stop(app);
-            if(furi_mutex_acquire(app->mutex, FuriWaitForever) != FuriStatusOk) {
-                FURI_LOG_E(TAG, "App Free: Failed to re-acquire mutex after stop");
-            }
-        }
-    } else {
-        FURI_LOG_E(TAG, "App Free: Failed to acquire mutex for stop check");
-    }
-
-    if(app->bt_initialized) {
-        bt_service_unsubscribe_status();
-    }
-
     if(app->file_browser) {
         view_dispatcher_remove_view(app->view_dispatcher, DocviewViewFileBrowser);
     }
-    view_dispatcher_remove_view(app->view_dispatcher, DocviewViewBleTransfer);
     view_dispatcher_remove_view(app->view_dispatcher, DocviewViewReader);
     view_dispatcher_remove_view(app->view_dispatcher, DocviewViewSubmenu);
 
-    popup_free(app->popup_ble);
     view_free(app->view_reader);
     submenu_free(app->submenu);
 
@@ -1252,10 +648,6 @@ void Docview_app_free(DocviewApp* app) {
         furi_timer_stop(app->timer);
         furi_timer_free(app->timer);
     }
-    if(app->ble_state.timeout_timer) {
-        furi_timer_stop(app->ble_state.timeout_timer);
-        furi_timer_free(app->ble_state.timeout_timer);
-    }
     if(app->notifications) {
         furi_record_close(RECORD_NOTIFICATION);
     }
@@ -1267,8 +659,6 @@ void Docview_app_free(DocviewApp* app) {
         file_browser_free(app->file_browser);
         app->file_browser = NULL;
     }
-
-    bt_service_deinit();
 
     if(app->mutex) {
         furi_mutex_release(app->mutex);
@@ -1283,26 +673,14 @@ int32_t main_Docview_app(void* p) {
     int32_t ret = 0;
     DocviewApp* app = NULL;
 
-    if(!furi_hal_bt_is_alive()) {
-        FURI_LOG_E(TAG, "Bluetooth stack is not available/alive. Exiting.");
-        return 255;
-    }
-    if(!furi_record_exists(RECORD_BT)) {
-        FURI_LOG_E(TAG, "BT record not found. Exiting.");
-        return 255;
-    }
-
     app = Docview_app_alloc();
     if(!app) {
         FURI_LOG_E(TAG, "Failed to allocate application structure");
         return 254;
     }
 
-    app->bt_initialized = false;
     app->ble_state.status = BleTransferStatusIdle;
     app->ble_state.transfer_active = false;
-    app->ble_state.thread = NULL;
-    app->ble_state.timeout_timer = NULL;
     app->ble_state.file_path = furi_string_alloc();
     if(!app->ble_state.file_path) {
         FURI_LOG_E(TAG, "Failed to allocate file path string");
@@ -1313,21 +691,12 @@ int32_t main_Docview_app(void* p) {
     app->notifications = furi_record_open(RECORD_NOTIFICATION);
     app->dialogs = furi_record_open(RECORD_DIALOGS);
 
-    app->bt_initialized = bt_service_init();
-    if(!app->bt_initialized) {
-        FURI_LOG_W(TAG, "Bluetooth service failed to initialize. BLE features disabled.");
-    }
-
     if(!docview_init_views(app)) {
         FURI_LOG_E(TAG, "Failed to initialize GUI views");
         if(app->notifications) furi_record_close(RECORD_NOTIFICATION);
         if(app->dialogs) furi_record_close(RECORD_DIALOGS);
         Docview_app_free(app);
         return 252;
-    }
-
-    if(app->bt_initialized) {
-        bt_service_subscribe_status(docview_ble_status_changed_callback, app);
     }
 
     view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);

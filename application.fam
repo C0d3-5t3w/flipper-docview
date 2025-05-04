@@ -18,8 +18,8 @@ App(
     # Include all required source files
     sources=[
         "src/docview.c",
-        "src/ble/bt_service.c",
-        "src/ble/furi_hal_bt_custom.h", # Add our new header
+        "src/ble/fbs.c",            # simple file‐by‐BLE serial
+        "src/ble/fbs.h",
         "src/icons/docview_icons.c",  
         "src/icons/ble_icons.c",
         "src/files/file_browser_utils.c",
@@ -34,7 +34,6 @@ App(
         "storage",
         "dialogs",
         "notification",
-        "bt", # Explicitly require the bt library
-        "furi_hal_bt", # Explicitly require the furi_hal_bt library
+        "ble_profile_serial",   # provide ble_profile_serial_init()/tx()
     ],
 )
